@@ -210,6 +210,77 @@ def test_patch_frontmatter_rejects_expected_revision_with_paths(served_vault):
         )
 
 
+# ── delete_tool / restore_tool dispatch ───────────────────────────────────
+
+def test_delete_tool_trashes_a_note(tmp_path, served_vault):
+    served_vault({"a.md": "body"})
+    result = server.delete_tool("a.md")
+
+    assert result["meta"]["kind"] == "note"
+    assert result["meta"]["action"] == "deleted"
+    assert result["path"] == "a.md"
+    assert result["data"]["trash"] is True
+    assert not (tmp_path / "a.md").exists()
+    assert (tmp_path / ".trash" / "a.md").exists()
+
+
+def test_delete_tool_trashes_a_folder_with_its_subtree(tmp_path, served_vault):
+    served_vault({"folder/a.md": "body", "folder/sub/b.md": "body"})
+    result = server.delete_tool("folder")
+
+    assert result["meta"]["kind"] == "folder"
+    assert result["path"] == "folder"
+    assert not (tmp_path / "folder").exists()
+    assert (tmp_path / ".trash" / "folder" / "sub" / "b.md").exists()
+
+
+def test_delete_tool_rejects_expected_revision_for_a_folder(served_vault):
+    served_vault({"folder/a.md": "body"})
+    with pytest.raises(ValueError, match="folder has no single"):
+        server.delete_tool("folder", expected_revision="sha256:" + "a" * 64)
+
+
+def test_delete_tool_honours_expected_revision_for_a_note(tmp_path, served_vault):
+    served_vault({"a.md": "body"})
+    revision = server.read_note_tool("a.md")["revision"]
+
+    stale = "sha256:" + "0" * 64
+    conflict = server.delete_tool("a.md", expected_revision=stale)
+    assert conflict.is_error, "a stale revision must not delete the note"
+    assert (tmp_path / "a.md").exists()
+
+    assert server.delete_tool("a.md", expected_revision=revision)["success"] is True
+    assert not (tmp_path / "a.md").exists()
+
+
+def test_delete_tool_reports_a_missing_path(served_vault):
+    served_vault({})
+    with pytest.raises(FileNotFoundError):
+        server.delete_tool("nope.md")
+
+
+def test_restore_tool_round_trips_a_note(tmp_path, served_vault):
+    served_vault({"a.md": "body"})
+    server.delete_tool("a.md")
+
+    result = server.restore_tool("a.md", "restored/a.md")
+
+    assert result["meta"]["kind"] == "note"
+    assert result["path"] == "restored/a.md"
+    assert (tmp_path / "restored" / "a.md").read_text() == "body"
+
+
+def test_restore_tool_round_trips_a_folder(tmp_path, served_vault):
+    served_vault({"folder/a.md": "body"})
+    server.delete_tool("folder")
+
+    result = server.restore_tool("folder", "back")
+
+    assert result["meta"]["kind"] == "folder"
+    assert result["path"] == "back"
+    assert (tmp_path / "back" / "a.md").read_text() == "body"
+
+
 REMOVED_TOOLS = (
     # Phase 2 — true aliases.
     "get_notes_by_tag_tool",
@@ -219,8 +290,12 @@ REMOVED_TOOLS = (
     "render_note_tool",
     "get_note_outline_tool",
     "get_tag_tree_tool",
-    # Phase 4 — folded into patch_frontmatter_tool.
+    # Phase 4 — folded into patch_frontmatter_tool / delete_tool / restore_tool.
     "patch_frontmatter_batch_tool",
+    "delete_note_tool",
+    "delete_folder_tool",
+    "restore_note_tool",
+    "restore_folder_tool",
 )
 
 

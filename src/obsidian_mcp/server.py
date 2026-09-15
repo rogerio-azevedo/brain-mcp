@@ -6,6 +6,7 @@ import hmac
 import logging
 import mimetypes
 import os
+import stat
 import threading
 from dataclasses import dataclass
 from functools import wraps
@@ -255,14 +256,17 @@ have to guess how a particular tool replies:
   without touching the body; pass `paths=[...]` to apply the same updates to several
   notes in one call, which returns the batch envelope (check `data.summary.failed`)
 - `manage_tags_tool(path, add, remove)` — add/remove tags in frontmatter and inline
-- `delete_note_tool(path, trash)` — trash=True (default) moves to .trash/
-- `restore_note_tool(trashed_name, to_path)` — undo a trashed delete; trashed_name from list_trash_tool
+- `delete_tool(path, trash)` — delete a note or a folder, whichever `path` is;
+  trash=True (default) moves it to .trash/
+- `restore_tool(trashed_name, to_path)` — undo a trashed delete of either;
+  trashed_name from list_trash_tool
 - `move_note_tool(from_path, to_path)` — rename/move + rewrites all wikilinks vault-wide
 - `find_replace_in_vault_tool(search, replace, mode, folder, dry_run)` — bulk find/replace across
   every note; dry_run=True (default) previews matches before writing anything
 
 High-impact mutation tools are disabled by default and absent from the tool
-list until explicitly enabled: `ENABLE_DELETE` registers note/folder deletion,
+list until explicitly enabled: `ENABLE_DELETE` registers delete_tool/
+restore_tool/list_trash_tool,
 `ENABLE_MOVE` registers note moves, `ENABLE_FOLDER_RENAME` registers folder
 renames, and `ENABLE_BULK_REPLACE` registers bulk replacement.
 
@@ -270,10 +274,8 @@ renames, and `ENABLE_BULK_REPLACE` registers bulk replacement.
 - `list_folder_tool(path, recursive, max_depth)` — contents (path="" = vault root); hides dotfiles;
   recursive=True returns a full tree dump in one call
 - `create_folder_tool(path)` — create folder, parents auto-created
-- `delete_folder_tool(path, trash)` — delete or trash a folder
-- `restore_folder_tool(trashed_name, to_path)` — undo a trashed delete; trashed_name from list_trash_tool
 - `rename_folder_tool(from_path, to_path)` — rename + rewrites path-based wikilinks
-- `list_trash_tool()` — see what's sitting in .trash/, with the names restore_*_tool expects
+- `list_trash_tool()` — see what's sitting in .trash/, with the names restore_tool expects
 
 ### Querying & Graph
 - `query_notes_tool(tags, status, frontmatter_filter, inline_field_filter, sort_by, limit, folder)` —
@@ -1033,35 +1035,75 @@ def patch_note_text_tool(
 
 
 @_mutation_boundary
-def delete_note_tool(
+def delete_tool(
     path: str,
     trash: bool = True,
     expected_revision: str | None = None,
     vault: str | None = None,
 ) -> dict:
-    """Delete a note from the vault.
-    trash=True (default) moves it to .trash/ instead of permanent deletion."""
-    result = delete_note(path, trash=trash, index=_index, expected_revision=expected_revision)
-    log_write("delete_note_tool", path, f"deleted (trash={trash})")
-    return _write_envelope(result)
+    """Delete a note or a folder — whichever `path` resolves to.
+
+    trash=True (default) moves it to .trash/ instead of permanent deletion;
+    recover it with restore_tool (list_trash_tool has the names).
+    Deleting a folder takes its whole subtree with it.
+
+    expected_revision pins a note's bytes so a concurrent edit isn't
+    discarded, and is therefore only valid for a note; a folder has no single
+    revision. data: {trash} plus meta.kind ('note' or 'folder')."""
+    storage = VaultStorage.from_config()
+    target = storage.resolve_delete(path, permanent=not trash)
+    if not storage.exists(target.relative, read=False):
+        raise FileNotFoundError(f"Path not found: {path!r}")
+
+    if stat.S_ISDIR(storage.stat(target.relative, read=False).st_mode):
+        if expected_revision is not None:
+            raise ValueError(
+                "expected_revision pins one note's bytes; a folder has no single "
+                f"revision, and {path!r} is a folder"
+            )
+        result = delete_folder(path, trash=trash)
+        kind = "folder"
+    else:
+        result = delete_note(
+            path, trash=trash, index=_index, expected_revision=expected_revision
+        )
+        kind = "note"
+
+    log_write("delete_tool", target.relative, f"deleted {kind} (trash={trash})")
+    return _write_envelope(result, meta={"kind": kind})
 
 
-if _feature_flags.enable_delete:
-    mcp.tool()(delete_note_tool)
+@_mutation_boundary
+def restore_tool(trashed_name: str, to_path: str, vault: str | None = None) -> dict:
+    """Restore a note or a folder from .trash/ — whichever `trashed_name` is.
 
-
-def restore_note_tool(trashed_name: str, to_path: str, vault: str | None = None) -> dict:
-    """Restore a note previously moved to .trash/ (see list_trash_tool for names).
-    to_path: where to put it back — the original folder can't be recovered
+    trashed_name: the bare name as it sits under .trash/ (see list_trash_tool);
+    a collision at delete time may have appended a random suffix, so it's
+    often not the original name.
+    to_path: where to put it back. The original location isn't recoverable
     from the trash entry alone, so you choose the destination.
-    Returns {from, to, status}."""
-    result = restore_note(trashed_name, to_path, index=_index)
-    log_write("restore_note_tool", to_path, f"restored from .trash/{trashed_name}")
-    return _write_envelope(result, path_key="to")
+
+    data: {from} plus notes_restored for a folder; meta.kind is 'note' or
+    'folder'."""
+    storage = VaultStorage.from_config()
+    if storage.trash_info(trashed_name).is_dir:
+        result = restore_folder(trashed_name, to_path, index=_index)
+        kind = "folder"
+    else:
+        result = restore_note(trashed_name, to_path, index=_index)
+        kind = "note"
+
+    log_write("restore_tool", to_path, f"restored {kind} from .trash/{trashed_name}")
+    return _write_envelope(
+        result,
+        path_key="path" if kind == "folder" else "to",
+        meta={"kind": kind},
+    )
 
 
 if _feature_flags.enable_delete:
-    mcp.tool()(restore_note_tool)
+    mcp.tool()(delete_tool)
+    mcp.tool()(restore_tool)
 
 
 def find_replace_in_vault_tool(
@@ -2076,19 +2118,6 @@ def create_folder_tool(path: str, vault: str | None = None) -> dict:
     return _write_envelope(result)
 
 
-def delete_folder_tool(path: str, trash: bool = True, vault: str | None = None) -> dict:
-    """Delete a vault folder.
-    trash=True (default) moves it to .trash/ instead of permanent deletion.
-    Returns {path, status, trash}."""
-    result = delete_folder(path, trash=trash)
-    log_write("delete_folder_tool", path, f"deleted folder (trash={trash})")
-    return _write_envelope(result)
-
-
-if _feature_flags.enable_delete:
-    mcp.tool()(delete_folder_tool)
-
-
 def rename_folder_tool(from_path: str, to_path: str, vault: str | None = None) -> dict:
     """Rename or move a vault folder. Rewrites path-based wikilinks in all
     notes that reference notes inside the moved folder.
@@ -2112,20 +2141,6 @@ def list_trash_tool(vault: str | None = None) -> dict:
 
 if _feature_flags.enable_delete:
     mcp.tool()(list_trash_tool)
-
-
-def restore_folder_tool(trashed_name: str, to_path: str, vault: str | None = None) -> dict:
-    """Restore a folder previously moved to .trash/ (see list_trash_tool for names).
-    to_path: where to put it back — the original parent path can't be
-    recovered from the trash entry alone, so you choose the destination.
-    Returns {path, status, notes_restored}."""
-    result = restore_folder(trashed_name, to_path, index=_index)
-    log_write("restore_folder_tool", to_path, f"restored from .trash/{trashed_name}")
-    return _write_envelope(result)
-
-
-if _feature_flags.enable_delete:
-    mcp.tool()(restore_folder_tool)
 
 
 # ── MCP Resources ─────────────────────────────────────────────────────────────

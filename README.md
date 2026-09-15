@@ -162,7 +162,7 @@ for the two auth variants in detail.
 # ENABLE_MOVE=true             # move_note_tool
 # ENABLE_FOLDER_RENAME=true    # rename_folder_tool
 # ENABLE_BULK_REPLACE=true     # find_replace_in_vault_tool
-# ENABLE_DELETE=true           # delete_note_tool and delete_folder_tool
+# ENABLE_DELETE=true           # delete_tool, restore_tool and list_trash_tool
 ```
 
 Each defaults to `false`. A disabled group's tools aren't just refused at
@@ -503,11 +503,11 @@ and any workflow rules.
 
 | Category | Tools |
 |---|---|
-| **Read** | `list_notes`, `read_note`, `search_notes`, `render_note`, `get_note_outline` |
-| **Write** | `write_note`, `patch_note`, `delete_note`*, `restore_note`*, `append_to_note`, `patch_frontmatter`, `manage_tags`, `move_note`, `find_replace_in_vault` |
-| **Folders** | `list_folder`, `create_folder`, `delete_folder`*, `restore_folder`*, `rename_folder`, `list_trash`* |
+| **Read** | `list_notes`, `read_note` (mode: full/outline/rendered), `search_notes` |
+| **Write** | `write_note`, `patch_note`, `delete`*, `restore`*, `append_to_note`, `patch_frontmatter` (one note or many), `manage_tags`, `move_note`, `find_replace_in_vault` |
+| **Folders** | `list_folder`, `create_folder`, `rename_folder`, `list_trash`* (folders are deleted/restored by `delete`*/`restore`*) |
 | **Query** | `query_notes`, `get_backlinks`, `get_broken_links`, `get_orphans`, `get_link_graph`, `get_vault_stats`, `get_tasks`, `resolve_alias` |
-| **Tags** | `get_tag_tree`, `list_all_tags` (notes for one tag: `query_notes(tags=[...])`) |
+| **Tags** | `list_all_tags` (mode: flat/tree; notes for one tag: `query_notes(tags=[...])`) |
 | **Periodic** | `get_periodic_note` |
 | **Canvas** | `list_canvases`, `read_canvas`, `write_canvas`, `patch_canvas` |
 | **Excalidraw** | `list_excalidraw`, `read_excalidraw`, `write_excalidraw`, `patch_excalidraw` |
