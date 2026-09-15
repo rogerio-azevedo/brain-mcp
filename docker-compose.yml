@@ -48,9 +48,8 @@ services:
       # Multiple isolated vaults instead of one: set this (and mount both
       # the config file and every vault path it references below), which
       # makes the path-policy and identity settings above come from that
-      # file. See README "Multi-Vault
-      # Setup" and vaults.json.example. Leave unset for the single-vault
-      # setup this file uses by default.
+      # file. See docs/multi-vault.md and vaults.json.example. Leave unset
+      # for the single-vault setup this file uses by default.
       - VAULTS_CONFIG=${VAULTS_CONFIG:-}
     volumes:
       - ${HOST_VAULT_PATH}:/vault

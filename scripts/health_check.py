@@ -5,14 +5,14 @@ schema violations, drops a note into the vault so a human notices without
 anyone needing to have asked. Silent (no note, no vault write) when the
 vault is clean — that's the point, no noise on every run.
 
-Meant to be invoked periodically by cron; see README.md's "Health-Check
-Cron" section for wiring examples (Docker container cron, or host cron +
-`docker exec`).
+Meant to be invoked periodically by cron; see docs/deployment.md's
+"Health-Check Cron" section for wiring examples (Docker container cron, or
+host cron + `docker exec`).
 
 Usage:
     VAULT_PATH=/path/to/vault python scripts/health_check.py
 
-Env vars (same ones the server itself reads, see README):
+Env vars (same ones the server itself reads, see docs/configuration.md):
     VAULT_PATH        (required)
     EXCLUDE_PATHS      (optional, default: "private,.obsidian")
     HEALTH_CHECK_INBOX (optional, default: "Inbox" — folder the report note
