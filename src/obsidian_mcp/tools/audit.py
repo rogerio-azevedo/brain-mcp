@@ -45,17 +45,3 @@ def get_audit_log(
         path_allowed=lambda entry_path: entry_path is None or policy.can_read(entry_path),
     )
 
-
-def get_note_history(path: str, limit: int = 20) -> list[dict]:
-    """Audit entries for one specific note, most recent first."""
-    cfg = get_config()
-    vault = cfg.resolve_vault_name()
-    policy = VaultAccessPolicy.from_config(cfg)
-    canonical_path = policy.resolve_read(path).relative
-    return audit_storage.read_entries(
-        cfg.audit_log_path,
-        path=canonical_path,
-        limit=limit,
-        vault=vault,
-        path_allowed=lambda entry_path: entry_path is None or policy.can_read(entry_path),
-    )

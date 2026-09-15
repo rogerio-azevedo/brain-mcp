@@ -29,7 +29,7 @@ The intended setup is to host obsidian-mcp on a server or NAS where your vault i
 - **Folders** — list (optionally recursive with a full tree dump), create, delete, rename folders; renaming rewrites path-based wikilinks vault-wide
 - **Query & Graph** — backlinks, broken links, orphan detection, BFS link graph, vault stats, task collection across vault
 - **Dataview-like queries** — filter notes by tags, status, frontmatter fields (exact match or `$ne`/`$in`/`$nin`/`$exists` operators), or inline fields (`key:: value`)
-- **Audit log** — every write-tool call is recorded ({timestamp, tool, path, summary}); `get_audit_log_tool`/`get_note_history_tool` query it
+- **Audit log** — every write-tool call is recorded ({timestamp, tool, path, summary}); `get_audit_log_tool` queries it (pass `path=` for one note's history)
 - **Periodic Notes** — read/preview daily, weekly, monthly, quarterly, yearly journal notes from templates
 - **Canvas** *(opt-in via `ENABLE_CANVAS`)* — read, create, and patch Obsidian Canvas (`.canvas`) files
 - **Excalidraw** *(opt-in via `ENABLE_EXCALIDRAW`)* — read, create, and patch Obsidian Excalidraw (`*.excalidraw.md`) drawings
@@ -507,8 +507,8 @@ and any workflow rules.
 | **Write** | `write_note`, `patch_note`, `delete_note`*, `restore_note`*, `append_to_note`, `patch_frontmatter`, `manage_tags`, `move_note`, `find_replace_in_vault` |
 | **Folders** | `list_folder`, `create_folder`, `delete_folder`*, `restore_folder`*, `rename_folder`, `list_trash`* |
 | **Query** | `query_notes`, `get_backlinks`, `get_broken_links`, `get_orphans`, `get_link_graph`, `get_vault_stats`, `get_tasks`, `resolve_alias` |
-| **Tags** | `get_notes_by_tag`, `get_tag_tree`, `list_all_tags` |
-| **Periodic** | `get_daily_note`, `get_periodic_note` |
+| **Tags** | `get_tag_tree`, `list_all_tags` (notes for one tag: `query_notes(tags=[...])`) |
+| **Periodic** | `get_periodic_note` |
 | **Canvas** | `list_canvases`, `read_canvas`, `write_canvas`, `patch_canvas` |
 | **Excalidraw** | `list_excalidraw`, `read_excalidraw`, `write_excalidraw`, `patch_excalidraw` |
 | **Kanban** | `read_kanban`, `create_kanban_board`, `add_kanban_card`, `move_kanban_card`, `delete_kanban_card` |

@@ -56,7 +56,7 @@ from .tools.attachments import (
     verify_attachment_token,
     write_attachment_bytes,
 )
-from .tools.audit import get_audit_log, get_note_history, log_write
+from .tools.audit import get_audit_log, log_write
 from .tools.bases import list_bases, patch_base, read_base, write_base
 from .tools.canvas import list_canvases, patch_canvas, read_canvas, write_canvas
 from .tools.excalidraw import (
@@ -86,9 +86,7 @@ from .tools.prompts import daily_note_prompt, weekly_review_prompt
 from .tools.query import (
     get_backlinks,
     get_broken_links,
-    get_daily_note,
     get_link_graph,
-    get_notes_by_tag,
     get_orphans,
     get_periodic_note,
     get_tag_tree,
@@ -282,12 +280,15 @@ renames, and `ENABLE_BULK_REPLACE` registers bulk replacement.
 - `get_broken_links_tool()` — wikilinks pointing to non-existent notes
 - `get_orphans_tool(exclude_folders)` — notes with no incoming backlinks
 - `get_link_graph_tool(root, depth, direction)` — BFS link graph; direction: outgoing|incoming|both
-- `get_audit_log_tool(path, tool, since, limit)` / `get_note_history_tool(path, limit)` — write-action
-  audit trail (what changed, when, with which tool), most recent first
+- `get_audit_log_tool(path, tool, since, limit)` — write-action audit trail
+  (what changed, when, with which tool), most recent first; pass `path=` to
+  get the history of one note
 - `get_vault_stats_tool()` — note/link counts, orphans, most-linked notes
 - `get_tasks_tool(status, folder, tag)` — tasks across vault; status: open|done|all
-- `get_notes_by_tag_tool(tag)`, `get_tag_tree_tool()`, `list_all_tags_tool(sort_by)`
-- `get_daily_note_tool(date)` / `get_periodic_note_tool(period, date)` — periodic notes; date: today|yesterday|YYYY-MM-DD
+- `get_tag_tree_tool()`, `list_all_tags_tool(sort_by)` — to list the notes
+  carrying one tag, use `query_notes_tool(tags=[tag])`
+- `get_periodic_note_tool(period, date)` — periodic notes;
+  period: daily|weekly|monthly|quarterly|yearly, date: today|yesterday|YYYY-MM-DD
 - `resolve_alias_tool(name)` — alias or stem → canonical vault path
 
 ### Multi-Vault
@@ -1212,12 +1213,6 @@ def get_backlinks_tool(path: str, vault: str | None = None) -> dict:
 
 
 @mcp.tool()
-def get_notes_by_tag_tool(tag: str, vault: str | None = None) -> dict:
-    """Return all notes that have the given tag. data.items is a list of paths."""
-    return list_result(get_notes_by_tag(tag, _index))
-
-
-@mcp.tool()
 def get_vault_conventions_tool(vault: str | None = None) -> dict:
     """Return the vault's AI instructions / conventions from _AI_INSTRUCTIONS.md.
     data.conventions is the raw Markdown."""
@@ -1239,13 +1234,6 @@ def get_audit_log_tool(
     write tools; canvas/kanban/excalidraw/bases writes aren't logged yet."""
     entries = get_audit_log(path=path, tool=tool, since=since, limit=limit)
     return list_result(entries, meta={"truncated": len(entries) >= limit})
-
-
-@mcp.tool()
-def get_note_history_tool(path: str, limit: int = 20, vault: str | None = None) -> dict:
-    """Audit-log entries for one specific note, most recent first —
-    what changed and when, without needing to know which tool was used."""
-    return list_result(get_note_history(path, limit=limit))
 
 
 @mcp.tool()
@@ -1365,15 +1353,6 @@ def get_tasks_tool(
     return list_result(
         get_tasks(_index, status=status, folder=folder, tag=tag, due_before=due_before, due_after=due_after)
     )
-
-
-@mcp.tool()
-def get_daily_note_tool(date: str = "today", vault: str | None = None) -> dict:
-    """Read a daily note from Journal/.
-    date: 'today' | 'yesterday' | 'YYYY-MM-DD'.
-    data: {exists, content, frontmatter, tasks}."""
-    result = get_daily_note(_index, date_str=date)
-    return _read_envelope(result.get("path"), result)
 
 
 @mcp.tool()
