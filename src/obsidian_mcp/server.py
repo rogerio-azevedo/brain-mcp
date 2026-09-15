@@ -226,13 +226,16 @@ have to guess how a particular tool replies:
 ### Reading & Search
 - `list_notes_tool(folder, include_meta)` — list notes; include_meta=True adds title/tags/status/mtime
 - `list_files_tool(folder, extension)` — list every file (any type, not just notes), optional extension filter
-- `read_note_tool(path)` — full note: content, frontmatter, tags, wikilinks, tasks, inline_fields
-- `get_note_outline_tool(path)` — headings, block refs, frontmatter keys — efficient for large notes
+- `read_note_tool(path, mode, depth)` — one note at the detail you need.
+  mode: 'full' (default; content, frontmatter, tags, wikilinks, tasks,
+  inline_fields) | 'outline' (headings, block refs, frontmatter keys — no body
+  text, so reach for it on large notes) | 'rendered' (![[embed]]
+  transclusions resolved inline; `depth` applies here only, 0=raw, 1=one
+  level, 2=nested)
 - `search_notes_tool(query, tag, mode, limit, frontmatter_filter, field, threshold)` — full-text search
   with snippets; mode: exact|regex|fuzzy; field: None|'filename'; combine with frontmatter_filter in one call
 - `find_similar_notes_tool(text, limit, exclude_path, min_score)` — TF-IDF similarity search for
   duplicate prevention ("does this topic already exist under different wording?")
-- `render_note_tool(path, depth)` — resolves ![[embed]] transclusions inline
 - `lint_schema_tool()` — validate frontmatter against the enums declared in _AI_INSTRUCTIONS.md
 
 ### Writing
@@ -285,7 +288,8 @@ renames, and `ENABLE_BULK_REPLACE` registers bulk replacement.
   get the history of one note
 - `get_vault_stats_tool()` — note/link counts, orphans, most-linked notes
 - `get_tasks_tool(status, folder, tag)` — tasks across vault; status: open|done|all
-- `get_tag_tree_tool()`, `list_all_tags_tool(sort_by)` — to list the notes
+- `list_all_tags_tool(sort_by, mode)` — every tag; mode: 'flat' (default,
+  with counts) | 'tree' (nested by slash hierarchy). To list the notes
   carrying one tag, use `query_notes_tool(tags=[tag])`
 - `get_periodic_note_tool(period, date)` — periodic notes;
   period: daily|weekly|monthly|quarterly|yearly, date: today|yesterday|YYYY-MM-DD
@@ -844,11 +848,40 @@ def list_notes_tool(folder: str = "", include_meta: bool = False, vault: str | N
 
 
 @mcp.tool()
-def read_note_tool(path: str, vault: str | None = None) -> dict:
-    """Read a note – data carries content, frontmatter, tags, aliases,
-    wikilinks, block_refs, callouts, and tasks. The envelope's `revision` is
-    the token to pass back as expected_revision when writing."""
-    return _read_envelope(path, read_note(path))
+def read_note_tool(
+    path: str,
+    mode: str = "full",
+    depth: int = 1,
+    vault: str | None = None,
+) -> dict:
+    """Read one note at the level of detail you actually need.
+
+    mode:
+    - 'full' (default) — data: {content, frontmatter, tags, aliases, wikilinks,
+      block_refs, callouts, tasks, inline_fields}.
+    - 'outline' — structure only, no body text: data: {headings, block_refs,
+      frontmatter_keys, tags, aliases, inline_fields, word_count, line_count}.
+      Use this on a large note when you only need its shape.
+    - 'rendered' — data: {rendered}, the note with all ![[embed]]
+      transclusions resolved inline.
+
+    depth applies to mode='rendered' only: 0=raw, 1=one level of embeds
+    (default), 2=nested embeds.
+
+    The envelope's `revision` is the token to pass back as expected_revision
+    when writing (modes 'full' and 'outline'; a rendered read spans several
+    notes, so it pins nothing)."""
+    if mode == "full":
+        return _read_envelope(path, read_note(path), meta={"mode": mode})
+    if mode == "outline":
+        return _read_envelope(path, get_note_outline(path), meta={"mode": mode})
+    if mode == "rendered":
+        return read_result(
+            path,
+            {"rendered": render_note(path, depth=depth)},
+            meta={"mode": mode, "depth": depth},
+        )
+    raise ValueError(f"Unknown mode: {mode!r}; expected 'full', 'outline' or 'rendered'")
 
 
 @mcp.tool()
@@ -877,22 +910,6 @@ def search_notes_tool(
         frontmatter_filter=frontmatter_filter, field=field, threshold=threshold,
     )
     return list_result(items, meta={"truncated": len(items) >= limit})
-
-
-@mcp.tool()
-def render_note_tool(path: str, depth: int = 1, vault: str | None = None) -> dict:
-    """Read a note with all ![[embed]] transclusions resolved inline.
-    depth: 0=raw, 1=one level of embeds (default), 2=nested embeds.
-    data.rendered is the resolved Markdown."""
-    return read_result(path, {"rendered": render_note(path, depth=depth)}, meta={"depth": depth})
-
-
-@mcp.tool()
-def get_note_outline_tool(path: str, vault: str | None = None) -> dict:
-    """Return the structural map of a note without its body text.
-    data: {headings, block_refs, frontmatter_keys, tags, word_count, line_count}.
-    Efficient for large notes where you only need structure."""
-    return _read_envelope(path, get_note_outline(path))
 
 
 @mcp.tool()
@@ -1320,18 +1337,24 @@ def get_vault_stats_tool(vault: str | None = None) -> dict:
 
 
 @mcp.tool()
-def get_tag_tree_tool(vault: str | None = None) -> dict:
-    """Return all tags as a nested tree (e.g. konzept → python, ki → llm).
-    data.tree is the nested mapping."""
-    return read_result(None, {"tree": get_tag_tree(_index)})
+def list_all_tags_tool(
+    sort_by: str = "count",
+    mode: str = "flat",
+    vault: str | None = None,
+) -> dict:
+    """Return every tag in the vault.
 
-
-@mcp.tool()
-def list_all_tags_tool(sort_by: str = "count", vault: str | None = None) -> dict:
-    """Return all tags in the vault with note counts.
-    sort_by: 'count' (descending, default) | 'name' (alphabetical).
-    data.items: [{tag, count}]."""
-    return list_result(list_all_tags(_index, sort_by=sort_by))
+    mode:
+    - 'flat' (default) — data.items: [{tag, count}], with note counts.
+      sort_by: 'count' (descending, default) | 'name' (alphabetical).
+    - 'tree' — data.tree: the same tags as a nested mapping that follows the
+      slash hierarchy (e.g. konzept → python, ki → llm). sort_by is ignored.
+    """
+    if mode == "flat":
+        return list_result(list_all_tags(_index, sort_by=sort_by), meta={"mode": mode})
+    if mode == "tree":
+        return read_result(None, {"tree": get_tag_tree(_index)}, meta={"mode": mode})
+    raise ValueError(f"Unknown mode: {mode!r}; expected 'flat' or 'tree'")
 
 
 @mcp.tool()

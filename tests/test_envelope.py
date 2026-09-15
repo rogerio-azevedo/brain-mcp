@@ -115,12 +115,12 @@ def test_every_envelope_is_an_object_with_success_and_data(result):
 
 # ── the two shape fixes this phase makes ──────────────────────────────────
 
-def test_render_note_tool_returns_an_object_not_a_bare_string(vault_factory):
+def test_rendered_read_returns_an_object_not_a_bare_string(vault_factory):
     vault_factory({
         "target.md": "Embedded body",
         "note.md": "Before\n![[target]]\nAfter",
     })
-    result = server.render_note_tool("note.md")
+    result = server.read_note_tool("note.md", mode="rendered")
     assert result["success"] is True
     assert result["path"] == "note.md"
     assert "Embedded body" in result["data"]["rendered"]
