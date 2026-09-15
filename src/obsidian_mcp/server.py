@@ -251,9 +251,9 @@ have to guess how a particular tool replies:
 - `patch_note_text_tool(path, find, replace, mode, count, dry_run)` — find/replace anywhere in a
   note's body, no heading/block-ref anchor required
 - `append_to_note_tool(path, content, section, create)` — append to end or under a heading
-- `patch_frontmatter_tool(path, updates, merge_arrays, dry_run)` — update YAML keys without touching
-  the body
-- `patch_frontmatter_batch_tool(updates)` — patch frontmatter on multiple notes in one call
+- `patch_frontmatter_tool(path | paths, updates, merge_arrays, dry_run)` — update YAML keys
+  without touching the body; pass `paths=[...]` to apply the same updates to several
+  notes in one call, which returns the batch envelope (check `data.summary.failed`)
 - `manage_tags_tool(path, add, remove)` — add/remove tags in frontmatter and inline
 - `delete_note_tool(path, trash)` — trash=True (default) moves to .trash/
 - `restore_note_tool(trashed_name, to_path)` — undo a trashed delete; trashed_name from list_trash_tool
@@ -1146,18 +1146,56 @@ def append_to_note_tool(
 @mcp.tool()
 @_mutation_boundary
 def patch_frontmatter_tool(
-    path: str,
-    updates: dict,
+    path: str | None = None,
+    updates: dict | None = None,
     merge_arrays: bool = True,
     dry_run: bool = False,
     expected_revision: str | None = None,
+    paths: list[str] | None = None,
     vault: str | None = None,
 ) -> dict:
     """Update specific YAML frontmatter keys without touching the note body.
+
+    Pass `path` for one note, or `paths` to apply the same `updates` to
+    several notes in one call — exactly one of the two.
+
     merge_arrays=True merges list values (e.g. tags); False replaces them.
-    Result carries a `diff` (unified diff against the current file).
-    dry_run=True previews {preview, diff, updated_keys} without writing —
-    check it, then call again with dry_run=False."""
+    dry_run=True previews data {preview, diff, updated_keys} without writing —
+    check it, then call again with dry_run=False.
+
+    With `path`: data carries {updated_keys, diff} and the envelope a
+    `revision`. With `paths`: one note failing doesn't abort the rest — this
+    returns the batch envelope, with data.results holding one item per note
+    ({success, path, revision} or {success: false, path, error}) and
+    data.summary the {total, succeeded, failed} tally. Always check
+    data.summary.failed. `expected_revision` pins a single note's bytes and so
+    can't be combined with `paths`."""
+    if (path is None) == (paths is None):
+        raise ValueError("Pass exactly one of path=<str> or paths=<list of str>")
+    if updates is None:
+        raise ValueError("updates is required")
+
+    if paths is not None:
+        if expected_revision is not None:
+            raise ValueError(
+                "expected_revision pins one note's bytes; it cannot be combined "
+                "with paths. Patch those notes one call at a time to pin each."
+            )
+        result = patch_frontmatter_batch(
+            [{"path": p, "updates": updates, "merge_arrays": merge_arrays} for p in paths],
+            index=_index,
+            dry_run=dry_run,
+        )
+        if not dry_run:
+            for entry in result["results"]:
+                if entry.get("success"):
+                    log_write(
+                        "patch_frontmatter_tool",
+                        entry.get("path"),
+                        f"updated keys: {entry.get('data', {}).get('updated_keys')}",
+                    )
+        return batch_result(result["results"], result["summary"])
+
     result = patch_frontmatter(
         path,
         updates,
@@ -1169,25 +1207,6 @@ def patch_frontmatter_tool(
     if result.get("status") != "dry_run":
         log_write("patch_frontmatter_tool", path, f"updated keys: {list(updates.keys())}")
     return _write_envelope(result)
-
-
-@mcp.tool()
-def patch_frontmatter_batch_tool(updates: list[dict], vault: str | None = None) -> dict:
-    """Patch frontmatter on multiple notes in one call.
-    updates: list of {"path": str, "updates": dict, "merge_arrays": bool,
-    "expected_revision": str} (merge_arrays defaults to True per entry).
-    One entry failing doesn't abort the rest — data.results holds one item per
-    entry ({success, path, revision} or {success: false, path, error}) and
-    data.summary the {total, succeeded, failed} tally."""
-    result = patch_frontmatter_batch(updates, index=_index)
-    for entry in result["results"]:
-        if entry.get("success"):
-            log_write(
-                "patch_frontmatter_batch_tool",
-                entry.get("path"),
-                f"updated keys: {entry.get('data', {}).get('updated_keys')}",
-            )
-    return batch_result(result["results"], result["summary"])
 
 
 @mcp.tool()

@@ -138,6 +138,78 @@ def test_alias_tools_are_gone(removed):
 
 # ── the instructions must describe the tools that actually exist ──────────
 
+# ── patch_frontmatter_tool(path | paths) ──────────────────────────────────
+
+def test_patch_frontmatter_single_path_returns_a_single_envelope(served_vault):
+    served_vault({"a.md": "---\nstatus: inbox\n---\nA"})
+    result = server.patch_frontmatter_tool("a.md", {"status": "active"})
+
+    assert result["path"] == "a.md"
+    assert result["revision"].startswith("sha256:")
+    assert result["data"]["updated_keys"] == ["status"]
+    assert "results" not in result["data"], "a single patch is not a batch"
+
+
+def test_patch_frontmatter_paths_applies_the_same_updates_to_each(tmp_path, served_vault):
+    served_vault({
+        "a.md": "---\nstatus: inbox\n---\nA",
+        "b.md": "---\nstatus: inbox\n---\nB",
+    })
+    result = server.patch_frontmatter_tool(
+        paths=["a.md", "b.md"], updates={"status": "active"}
+    )
+
+    assert result["data"]["summary"] == {"total": 2, "succeeded": 2, "failed": 0}
+    assert [item["path"] for item in result["data"]["results"]] == ["a.md", "b.md"]
+    assert "status: active" in (tmp_path / "a.md").read_text()
+    assert "status: active" in (tmp_path / "b.md").read_text()
+
+
+def test_patch_frontmatter_paths_reports_partial_failure(tmp_path, served_vault):
+    served_vault({"a.md": "---\nstatus: inbox\n---\nA"})
+    result = server.patch_frontmatter_tool(
+        paths=["a.md", "missing.md"], updates={"status": "active"}
+    )
+
+    assert result["success"] is True, "the batch ran; the failure is per item"
+    assert result["data"]["summary"] == {"total": 2, "succeeded": 1, "failed": 1}
+    ok, failure = result["data"]["results"]
+    assert ok["success"] is True
+    assert failure == {
+        "success": False,
+        "path": "missing.md",
+        "error": {"type": "FileNotFoundError", "message": failure["error"]["message"]},
+    }
+    # The good note was still written.
+    assert "status: active" in (tmp_path / "a.md").read_text()
+
+
+def test_patch_frontmatter_paths_honours_dry_run(tmp_path, served_vault):
+    served_vault({"a.md": "---\nstatus: inbox\n---\nA"})
+    result = server.patch_frontmatter_tool(
+        paths=["a.md"], updates={"status": "active"}, dry_run=True
+    )
+
+    assert "status: active" in result["data"]["results"][0]["data"]["preview"]
+    assert "status: inbox" in (tmp_path / "a.md").read_text()
+
+
+def test_patch_frontmatter_requires_exactly_one_of_path_or_paths(served_vault):
+    served_vault({"a.md": "---\nstatus: inbox\n---\nA"})
+    with pytest.raises(ValueError, match="exactly one"):
+        server.patch_frontmatter_tool(updates={"status": "active"})
+    with pytest.raises(ValueError, match="exactly one"):
+        server.patch_frontmatter_tool("a.md", paths=["a.md"], updates={"status": "x"})
+
+
+def test_patch_frontmatter_rejects_expected_revision_with_paths(served_vault):
+    served_vault({"a.md": "---\nstatus: inbox\n---\nA"})
+    with pytest.raises(ValueError, match="expected_revision"):
+        server.patch_frontmatter_tool(
+            paths=["a.md"], updates={"status": "x"}, expected_revision="sha256:" + "a" * 64
+        )
+
+
 REMOVED_TOOLS = (
     # Phase 2 — true aliases.
     "get_notes_by_tag_tool",
@@ -147,6 +219,8 @@ REMOVED_TOOLS = (
     "render_note_tool",
     "get_note_outline_tool",
     "get_tag_tree_tool",
+    # Phase 4 — folded into patch_frontmatter_tool.
+    "patch_frontmatter_batch_tool",
 )
 
 

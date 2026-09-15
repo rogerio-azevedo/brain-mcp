@@ -401,16 +401,17 @@ def patch_frontmatter(
 def patch_frontmatter_batch(
     updates: list[dict],
     index: VaultIndex | None = None,
+    dry_run: bool = False,
 ) -> dict:
-    """Patch frontmatter on multiple notes in one call instead of one
-    patch_frontmatter_tool call per note.
+    """Patch frontmatter on multiple notes in one pass instead of one
+    patch_frontmatter call per note.
 
-    updates: list of {"path": str, "updates": dict, "merge_arrays": bool}
-    (merge_arrays defaults to True per entry, same as patch_frontmatter_tool).
-    One entry failing (missing note, bad path, stale expected_revision, ...)
-    doesn't abort the rest — every entry produces one envelope-shaped item,
-    carrying either its committed `revision` or an `error` with the raised
-    exception's class name.
+    updates: list of {"path": str, "updates": dict, "merge_arrays": bool,
+    "expected_revision": str} (merge_arrays defaults to True per entry, same
+    as patch_frontmatter). One entry failing (missing note, bad path, stale
+    expected_revision, ...) doesn't abort the rest — every entry produces one
+    envelope-shaped item, carrying either its committed `revision` or an
+    `error` with the raised exception's class name.
 
     Returns {"results": [...], "summary": {total, succeeded, failed}}.
     """
@@ -423,17 +424,17 @@ def patch_frontmatter_batch(
                 entry.get("updates", {}),
                 merge_arrays=entry.get("merge_arrays", True),
                 index=index,
+                dry_run=dry_run,
                 expected_revision=entry.get("expected_revision"),
             )
+            data = {
+                "updated_keys": result.get("updated_keys", []),
+                "diff": result.get("diff", ""),
+            }
+            if dry_run:
+                data["preview"] = result.get("preview", "")
             results.append(
-                batch_item(
-                    result["path"],
-                    revision=result.get("revision"),
-                    data={
-                        "updated_keys": result.get("updated_keys", []),
-                        "diff": result.get("diff", ""),
-                    },
-                )
+                batch_item(result["path"], revision=result.get("revision"), data=data)
             )
         except Exception as exc:
             results.append(batch_error(path, exc))
