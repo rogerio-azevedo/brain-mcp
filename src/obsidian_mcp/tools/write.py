@@ -13,6 +13,7 @@ from ..domain.models import (
     RevisionConflictError,
     normalize_revision_token,
 )
+from ..envelope import batch_error, batch_item, batch_summary
 from ..storage.filesystem import VaultStorage
 from ..storage.locking import acquire_lock
 from ..storage.policy import ReadPermissionError, WritePermissionError
@@ -140,12 +141,14 @@ def patch_note(
     mode: str = "replace",
     target_type: str = "heading",
     index: VaultIndex | None = None,
+    dry_run: bool = False,
     expected_revision: str | None = None,
 ) -> dict:
     """Edit a note section or block reference.
 
     mode: 'replace' | 'insert_before' | 'insert_after' | 'append'
     target_type: 'heading' | 'block_ref'
+    dry_run: render the patch and return {preview, diff} without writing.
     """
     _require_note_path(path)
     target = _storage().resolve_write(path)
@@ -159,6 +162,19 @@ def patch_note(
             patched = _patch_block_ref(raw, section, new_content, mode)
         else:
             patched = _patch_section(raw, section, new_content, mode)
+        diff = _unified_diff(raw, patched, path)
+
+        if dry_run:
+            return {
+                "path": path,
+                "status": "dry_run",
+                "mode": mode,
+                "target_type": target_type,
+                "preview": patched,
+                "diff": diff,
+                "revision": current_revision,
+            }
+
         revision = storage.write_text_atomic(path, patched, expected_revision=current_revision)
     finally:
         lock.release()
@@ -167,7 +183,13 @@ def patch_note(
         index.update(path)
 
     return revision_result(
-        {"path": path, "status": "patched", "mode": mode, "target_type": target_type},
+        {
+            "path": path,
+            "status": "patched",
+            "mode": mode,
+            "target_type": target_type,
+            "diff": diff,
+        },
         revision,
     )
 
@@ -385,11 +407,14 @@ def patch_frontmatter_batch(
 
     updates: list of {"path": str, "updates": dict, "merge_arrays": bool}
     (merge_arrays defaults to True per entry, same as patch_frontmatter_tool).
-    One entry failing (missing note, bad path, ...) doesn't abort the rest —
-    each result lands in `succeeded` or `failed`.
+    One entry failing (missing note, bad path, stale expected_revision, ...)
+    doesn't abort the rest — every entry produces one envelope-shaped item,
+    carrying either its committed `revision` or an `error` with the raised
+    exception's class name.
+
+    Returns {"results": [...], "summary": {total, succeeded, failed}}.
     """
-    succeeded: list[dict] = []
-    failed: list[dict] = []
+    results: list[dict] = []
     for entry in updates:
         path = entry.get("path")
         try:
@@ -400,11 +425,20 @@ def patch_frontmatter_batch(
                 index=index,
                 expected_revision=entry.get("expected_revision"),
             )
-            succeeded.append(result)
+            results.append(
+                batch_item(
+                    result["path"],
+                    revision=result.get("revision"),
+                    data={
+                        "updated_keys": result.get("updated_keys", []),
+                        "diff": result.get("diff", ""),
+                    },
+                )
+            )
         except Exception as exc:
-            failed.append({"path": path, "error": str(exc)})
+            results.append(batch_error(path, exc))
 
-    return {"succeeded": succeeded, "failed": failed}
+    return {"results": results, "summary": batch_summary(results)}
 
 
 _FM_RE = re.compile(r"^---\n(.*?)\n---\n?", re.DOTALL)

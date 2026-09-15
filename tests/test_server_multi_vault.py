@@ -362,8 +362,9 @@ async def test_middleware_allows_vault_discovery_without_default(tmp_path, monke
     )
     result = await middleware.on_call_tool(context, call_next)
 
-    assert {item["name"] for item in result} == {"private", "monari"}
-    assert not any(item["is_default"] for item in result)
+    items = result["data"]["items"]
+    assert {item["name"] for item in items} == {"private", "monari"}
+    assert not any(item["is_default"] for item in items)
 
 
 # ── list_vaults_tool ─────────────────────────────────────────────────────
@@ -371,8 +372,9 @@ async def test_middleware_allows_vault_discovery_without_default(tmp_path, monke
 def test_list_vaults_tool_single_vault_mode(vault_factory):
     vault_factory({})
     result = list_vaults_tool()
-    assert len(result) == 1
-    assert result[0]["is_default"] is True
+    assert result["success"] is True
+    assert result["meta"]["count"] == 1
+    assert result["data"]["items"][0]["is_default"] is True
 
 
 def test_list_vaults_tool_multi_vault_mode(tmp_path, monkeypatch):
@@ -390,7 +392,7 @@ def test_list_vaults_tool_multi_vault_mode(tmp_path, monkeypatch):
     )
 
     result = list_vaults_tool()
-    names = {v["name"]: v["is_default"] for v in result}
+    names = {v["name"]: v["is_default"] for v in result["data"]["items"]}
     assert names == {"private": True, "monari": False}
 
 

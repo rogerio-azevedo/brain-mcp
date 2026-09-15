@@ -419,8 +419,9 @@ def test_patch_frontmatter_batch_applies_all(tmp_path, vault_factory):
         {"path": "a.md", "updates": {"status": "active"}},
         {"path": "b.md", "updates": {"status": "done"}},
     ])
-    assert len(result["succeeded"]) == 2
-    assert result["failed"] == []
+    assert result["summary"] == {"total": 2, "succeeded": 2, "failed": 0}
+    assert all(item["success"] for item in result["results"])
+    assert all(item["revision"].startswith("sha256:") for item in result["results"])
     assert "status: active" in (tmp_path / "a.md").read_text()
     assert "status: done" in (tmp_path / "b.md").read_text()
 
@@ -431,9 +432,18 @@ def test_patch_frontmatter_batch_partial_failure(tmp_path, vault_factory):
         {"path": "a.md", "updates": {"status": "active"}},
         {"path": "missing.md", "updates": {"status": "active"}},
     ])
-    assert len(result["succeeded"]) == 1
-    assert len(result["failed"]) == 1
-    assert result["failed"][0]["path"] == "missing.md"
+    assert result["summary"] == {"total": 2, "succeeded": 1, "failed": 1}
+    ok, failure = result["results"]
+    assert ok == {
+        "success": True,
+        "path": "a.md",
+        "revision": ok["revision"],
+        "data": ok["data"],
+    }
+    assert failure["success"] is False
+    assert failure["path"] == "missing.md"
+    assert failure["error"]["type"] == "FileNotFoundError"
+    assert failure["error"]["message"]
     assert "status: active" in (tmp_path / "a.md").read_text()
 
 

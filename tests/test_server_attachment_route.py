@@ -530,9 +530,11 @@ def test_create_attachment_token_tool_multi_vault_signs_with_identity_key(tmp_pa
     # context by hand to simulate what it would have done for vault="monari".
     context_token = cfg_mod.set_current_vault("monari")
     try:
-        token = server.create_attachment_token_tool("file.png", vault="monari")
+        result = server.create_attachment_token_tool("file.png", vault="monari")
     finally:
         cfg_mod.reset_current_vault(context_token)
+    assert result["path"] == "file.png"
+    token = result["data"]
     assert token["vault"] == "monari"
     assert not verify_attachment_token(
         "wrong-key", "PUT", "file.png", "monari", token["expires_at"], token["sig"]

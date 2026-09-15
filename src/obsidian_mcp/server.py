@@ -29,6 +29,14 @@ from .config import (
 )
 from .domain.index import VaultIndex
 from .domain.models import PreconditionRequiredError, RevisionConflictError
+from .envelope import (
+    batch_item,
+    batch_result,
+    batch_summary,
+    list_result,
+    read_result,
+    write_result,
+)
 from .storage.filesystem import VaultStorage
 from .storage.policy import (
     InvalidFileTypeError,
@@ -125,6 +133,42 @@ def _mutation_boundary(function):
     return wrapped
 
 
+def _read_envelope(path: str | None, result: dict, meta: dict | None = None) -> dict:
+    """Lift a tool-layer read dict into the canonical read envelope.
+
+    The payload's own ``path``/``revision`` keys are promoted to the envelope
+    top level rather than duplicated inside ``data``.
+    """
+    payload = dict(result)
+    payload.pop("path", None)
+    revision = payload.pop("revision", None)
+    return read_result(path, payload, revision=revision, meta=meta)
+
+
+def _write_envelope(
+    result: dict,
+    *,
+    path_key: str = "path",
+    action: str | None = None,
+    meta: dict | None = None,
+) -> dict:
+    """Lift a tool-layer mutation dict into the canonical write envelope.
+
+    The tool layer's legacy ``status`` string becomes ``meta.action``; a
+    ``dry_run`` status additionally sets ``meta.dry_run`` so callers can test
+    one flag instead of comparing verbs.
+    """
+    payload = dict(result)
+    path = payload.pop(path_key, None)
+    verb = action or payload.pop("status", None) or "written"
+    payload.pop("status", None)
+    revision = payload.pop("revision", None)
+    extra = dict(meta or {})
+    if verb == "dry_run":
+        extra["dry_run"] = True
+    return write_result(path, verb, revision=revision, data=payload, meta=extra)
+
+
 _DEFAULT_INSTRUCTIONS = r"""\
 You are connected to **obsidian-mcp**, an MCP server for an Obsidian vault.
 
@@ -156,6 +200,31 @@ needs structure; many notes need no heading at all.
 
 ## Tool Reference
 
+### Result Shape
+Every tool returns one JSON object with the same outer shape, so you never
+have to guess how a particular tool replies:
+
+    {"success": true, "path": "...", "revision": "sha256:...",
+     "data": {...}, "meta": {...}}
+
+- `success` is always a boolean. `path` is there for single-item results and
+  omitted for vault-wide and list results.
+- `data` is the tool-specific payload, and is always present. A listing puts
+  its rows in `data.items`; per-tool `data` keys are named in each tool's own
+  description.
+- `meta` is only present when there's something to say — `count` and
+  `truncated` on a listing, `action` and `dry_run` on a write.
+- `revision` comes back on every read and every successful write; pass it as
+  `expected_revision` on a later write to pin that write to the bytes you
+  read (see "### Writing").
+- A batch tool reports per-item outcomes in `data.results`
+  (`{success, path, revision}` or `{success: false, path, error}`, where
+  `error.type` is the exception class name) and tallies them in
+  `data.summary`. Top-level `success` only says the batch ran — always check
+  `data.summary.failed`.
+- Real failures (bad path, permission denied, revision conflict) come back as
+  MCP errors, not as `success: false`.
+
 ### Reading & Search
 - `list_notes_tool(folder, include_meta)` — list notes; include_meta=True adds title/tags/status/mtime
 - `list_files_tool(folder, extension)` — list every file (any type, not just notes), optional extension filter
@@ -172,15 +241,17 @@ needs structure; many notes need no heading at all.
 - Direct reads return an opaque `revision`. Pass it as `expected_revision` to pin a write
   to those bytes. On a revision conflict, read again before deciding whether to retry.
   A retried append with an old revision fails safely; a blind retry can append twice.
+- Every `dry_run` tool previews into `data.preview`/`data.diff` and writes nothing;
+  check it, then call again with dry_run=False.
 - `write_note_tool(path, content, dry_run)` — create or overwrite a note; preserves existing
-  frontmatter if the new content has none; dry_run previews {preview, diff} without writing
-- `patch_note_tool(path, section, new_content, mode, target_type)` — edit one section;
+  frontmatter if the new content has none
+- `patch_note_tool(path, section, new_content, mode, target_type, dry_run)` — edit one section;
   mode: replace|insert_before|insert_after|append — target_type: heading|block_ref
 - `patch_note_text_tool(path, find, replace, mode, count, dry_run)` — find/replace anywhere in a
   note's body, no heading/block-ref anchor required
 - `append_to_note_tool(path, content, section, create)` — append to end or under a heading
 - `patch_frontmatter_tool(path, updates, merge_arrays, dry_run)` — update YAML keys without touching
-  the body; dry_run previews {preview, diff} without writing
+  the body
 - `patch_frontmatter_batch_tool(updates)` — patch frontmatter on multiple notes in one call
 - `manage_tags_tool(path, add, remove)` — add/remove tags in frontmatter and inline
 - `delete_note_tool(path, trash)` — trash=True (default) moves to .trash/
@@ -220,9 +291,9 @@ renames, and `ENABLE_BULK_REPLACE` registers bulk replacement.
 - `resolve_alias_tool(name)` — alias or stem → canonical vault path
 
 ### Multi-Vault
-- `list_vaults_tool()` — vault(s) the current identity may access:
-  [{name, description, is_default}]. Every other tool accepts an optional
-  `vault=<name>` argument to operate on a non-default one for that call.
+- `list_vaults_tool()` — vault(s) the current identity may access, as
+  `data.items` of {name, description, is_default}. Every other tool accepts an
+  optional `vault=<name>` argument to operate on a non-default one for that call.
 
 ### Attachments
 - `list_attachments_tool(folder)`, `read_attachment_tool(path)`, `add_attachment_tool(path, content_base64)`
@@ -250,13 +321,14 @@ broken.
 - `add_kanban_card_tool(path, column, text, done)`, `move_kanban_card_tool(...)`, `delete_kanban_card_tool(...)`
 
 ### Excalidraw (*.excalidraw.md, Obsidian Excalidraw plugin)
-- `list_excalidraw_tool()`, `read_excalidraw_tool(path)` — returns {path, elements, app_state, files}
+- `list_excalidraw_tool()`, `read_excalidraw_tool(path)`
 - `write_excalidraw_tool(path, elements, app_state)` — element types: rectangle|ellipse|text|arrow|freedraw|...
 - `patch_excalidraw_tool(path, add_elements, update_elements, delete_element_ids)`
 
 ### Bases (.base files, Obsidian core plugin since 1.9.0)
-- `list_bases_tool()`, `read_base_tool(path)` — returns {path, filters, formulas, properties, views}
-- `write_base_tool(path, filters, formulas, properties, views)` — returns known_properties from existing bases
+- `list_bases_tool()`, `read_base_tool(path)`
+- `write_base_tool(path, filters, formulas, properties, views)` — `data.known_properties`
+  collects property names already used by other bases, to keep naming consistent
 - `patch_base_tool(path, update_formulas, delete_formula_keys, update_properties, delete_property_keys, set_filters, add_views, update_views, delete_view_names)`
 
 ## MCP Resources
@@ -762,17 +834,20 @@ def daily_note(date: str = "today") -> str:
 # ── Read ──────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def list_notes_tool(folder: str = "", include_meta: bool = False, vault: str | None = None) -> list:
+def list_notes_tool(folder: str = "", include_meta: bool = False, vault: str | None = None) -> dict:
     """List all Markdown notes in the vault (or a subfolder).
-    Set include_meta=True to get title, tags, status, created per note."""
-    return list_notes(folder, include_meta=include_meta)
+    Set include_meta=True to get title, tags, status, created per note.
+    data.items is a list of paths, or of {path, title, tags, status, created,
+    mtime} when include_meta=True."""
+    return list_result(list_notes(folder, include_meta=include_meta))
 
 
 @mcp.tool()
 def read_note_tool(path: str, vault: str | None = None) -> dict:
-    """Read a note – returns content, frontmatter, tags, aliases, wikilinks,
-    block_refs, callouts, and tasks."""
-    return read_note(path)
+    """Read a note – data carries content, frontmatter, tags, aliases,
+    wikilinks, block_refs, callouts, and tasks. The envelope's `revision` is
+    the token to pass back as expected_revision when writing."""
+    return _read_envelope(path, read_note(path))
 
 
 @mcp.tool()
@@ -785,9 +860,10 @@ def search_notes_tool(
     field: str | None = None,
     threshold: float = 0.8,
     vault: str | None = None,
-) -> list[dict]:
+) -> dict:
     """Full-text search with snippets and relevance ranking.
-    mode: 'exact' (default) | 'regex' | 'fuzzy'. Returns [{path, score, snippets, tags}].
+    mode: 'exact' (default) | 'regex' | 'fuzzy'.
+    data.items: [{path, score, snippets, tags}].
     frontmatter_filter: combine with the text search in one call — same shape
     as query_notes_tool's (plain value = exact match, or {"$ne": v} /
     {"$nin": [...]} / {"$exists": bool}).
@@ -795,25 +871,27 @@ def search_notes_tool(
     only the file name).
     threshold: fuzzy-match similarity cutoff 0-1 (only used when mode='fuzzy';
     lower = looser matches, higher = less noise)."""
-    return search_notes(
+    items = search_notes(
         query, tag=tag, mode=mode, limit=limit,
         frontmatter_filter=frontmatter_filter, field=field, threshold=threshold,
     )
+    return list_result(items, meta={"truncated": len(items) >= limit})
 
 
 @mcp.tool()
-def render_note_tool(path: str, depth: int = 1, vault: str | None = None) -> str:
+def render_note_tool(path: str, depth: int = 1, vault: str | None = None) -> dict:
     """Read a note with all ![[embed]] transclusions resolved inline.
-    depth: 0=raw, 1=one level of embeds (default), 2=nested embeds."""
-    return render_note(path, depth=depth)
+    depth: 0=raw, 1=one level of embeds (default), 2=nested embeds.
+    data.rendered is the resolved Markdown."""
+    return read_result(path, {"rendered": render_note(path, depth=depth)}, meta={"depth": depth})
 
 
 @mcp.tool()
 def get_note_outline_tool(path: str, vault: str | None = None) -> dict:
     """Return the structural map of a note without its body text.
-    Returns {headings, block_refs, frontmatter_keys, tags, word_count, line_count}.
+    data: {headings, block_refs, frontmatter_keys, tags, word_count, line_count}.
     Efficient for large notes where you only need structure."""
-    return get_note_outline(path)
+    return _read_envelope(path, get_note_outline(path))
 
 
 @mcp.tool()
@@ -823,7 +901,7 @@ def find_similar_notes_tool(
     exclude_path: str | None = None,
     min_score: float = 0.1,
     vault: str | None = None,
-) -> list[dict]:
+) -> dict:
     """Find conceptually related notes even when the wording differs — for
     duplicate prevention before creating a new note ("does this topic
     already exist under different vocabulary?"). Ranks by TF-IDF cosine
@@ -832,8 +910,10 @@ def find_similar_notes_tool(
     words across differently-phrased notes, not pure synonym rewrites).
     exclude_path: skip a note (e.g. the one you're editing) from results.
     min_score: filters out noise-level matches (0-1, higher = stricter).
-    Returns [{path, score}], most similar first."""
-    return find_similar_notes(text, _index, limit=limit, exclude_path=exclude_path, min_score=min_score)
+    data.items: [{path, score}], most similar first."""
+    return list_result(
+        find_similar_notes(text, _index, limit=limit, exclude_path=exclude_path, min_score=min_score)
+    )
 
 
 # ── Write ─────────────────────────────────────────────────────────────────────
@@ -865,7 +945,7 @@ def write_note_tool(
     )
     if result.get("status") != "dry_run":
         log_write("write_note_tool", path, "wrote note")
-    return result
+    return _write_envelope(result)
 
 
 @mcp.tool()
@@ -876,12 +956,15 @@ def patch_note_tool(
     new_content: str,
     mode: str = "replace",
     target_type: str = "heading",
+    dry_run: bool = False,
     expected_revision: str | None = None,
     vault: str | None = None,
 ) -> dict:
     """Edit a section or block reference inside a note.
     mode: 'replace' (default) | 'insert_before' | 'insert_after' | 'append'.
-    target_type: 'heading' (default) | 'block_ref' (use section='^block-id')."""
+    target_type: 'heading' (default) | 'block_ref' (use section='^block-id').
+    dry_run=True previews data {preview, diff} without writing — check it,
+    then call again with dry_run=False."""
     result = patch_note(
         path,
         section,
@@ -889,10 +972,12 @@ def patch_note_tool(
         mode=mode,
         target_type=target_type,
         index=_index,
+        dry_run=dry_run,
         expected_revision=expected_revision,
     )
-    log_write("patch_note_tool", path, f"patched section {section!r} ({mode})")
-    return result
+    if result.get("status") != "dry_run":
+        log_write("patch_note_tool", path, f"patched section {section!r} ({mode})")
+    return _write_envelope(result)
 
 
 @mcp.tool()
@@ -926,7 +1011,7 @@ def patch_note_text_tool(
     )
     if result.get("status") != "dry_run":
         log_write("patch_note_text_tool", path, f"replaced {result.get('replacements')} match(es)")
-    return result
+    return _write_envelope(result)
 
 
 @_mutation_boundary
@@ -940,7 +1025,7 @@ def delete_note_tool(
     trash=True (default) moves it to .trash/ instead of permanent deletion."""
     result = delete_note(path, trash=trash, index=_index, expected_revision=expected_revision)
     log_write("delete_note_tool", path, f"deleted (trash={trash})")
-    return result
+    return _write_envelope(result)
 
 
 if _feature_flags.enable_delete:
@@ -954,7 +1039,7 @@ def restore_note_tool(trashed_name: str, to_path: str, vault: str | None = None)
     Returns {from, to, status}."""
     result = restore_note(trashed_name, to_path, index=_index)
     log_write("restore_note_tool", to_path, f"restored from .trash/{trashed_name}")
-    return result
+    return _write_envelope(result, path_key="to")
 
 
 if _feature_flags.enable_delete:
@@ -971,20 +1056,45 @@ def find_replace_in_vault_tool(
 ) -> dict:
     """Find and replace text across every note in the vault (or a subfolder).
     mode: 'exact' (default, literal substring) | 'regex'.
-    dry_run=True (default) only previews matches — {matches: [{path, match_count, preview}], total_matches}.
+    dry_run=True (default) only previews matches.
     Always run once with dry_run=True first, then dry_run=False to actually write.
     .trash/ and EXCLUDE_PATHS are always skipped; write-protected files
     (READ_ONLY or outside WRITE_PATHS) are skipped and listed under
-    skipped_write_protected rather than aborting the whole run.
-    Returns {replaced_in, total_replacements, skipped_write_protected} when dry_run=False."""
+    data.summary.skipped_write_protected rather than aborting the whole run.
+    This is a batch result: data.results holds one item per affected note
+    (with {match_count, preview} on a dry run) and data.summary the tallies
+    ({total, succeeded, failed, dry_run, total_matches | total_replacements,
+    skipped_write_protected})."""
     result = find_replace_in_vault(search, replace, mode=mode, folder=folder, dry_run=dry_run, index=_index)
-    if not result.get("dry_run"):
-        log_write(
-            "find_replace_in_vault_tool",
-            folder or None,
-            f"replaced in {len(result.get('replaced_in', []))} note(s)",
-        )
-    return result
+    if result.get("dry_run"):
+        items = [
+            batch_item(
+                match["path"],
+                data={"match_count": match["match_count"], "preview": match["preview"]},
+            )
+            for match in result.get("matches", [])
+        ]
+        summary = {
+            **batch_summary(items),
+            "dry_run": True,
+            "total_matches": result.get("total_matches", 0),
+            "skipped_write_protected": result.get("skipped_write_protected", []),
+        }
+        return batch_result(items, summary)
+
+    log_write(
+        "find_replace_in_vault_tool",
+        folder or None,
+        f"replaced in {len(result.get('replaced_in', []))} note(s)",
+    )
+    items = [batch_item(path) for path in result.get("replaced_in", [])]
+    summary = {
+        **batch_summary(items),
+        "dry_run": False,
+        "total_replacements": result.get("total_replacements", 0),
+        "skipped_write_protected": result.get("skipped_write_protected", []),
+    }
+    return batch_result(items, summary)
 
 
 if _feature_flags.enable_bulk_replace:
@@ -1012,7 +1122,7 @@ def append_to_note_tool(
         expected_revision=expected_revision,
     )
     log_write("append_to_note_tool", path, "appended content" + (f" under {section!r}" if section else ""))
-    return result
+    return _write_envelope(result)
 
 
 @mcp.tool()
@@ -1040,19 +1150,26 @@ def patch_frontmatter_tool(
     )
     if result.get("status") != "dry_run":
         log_write("patch_frontmatter_tool", path, f"updated keys: {list(updates.keys())}")
-    return result
+    return _write_envelope(result)
 
 
 @mcp.tool()
 def patch_frontmatter_batch_tool(updates: list[dict], vault: str | None = None) -> dict:
     """Patch frontmatter on multiple notes in one call.
-    updates: list of {"path": str, "updates": dict, "merge_arrays": bool}
-    (merge_arrays defaults to True per entry). One entry failing doesn't
-    abort the rest — returns {succeeded: [...], failed: [{path, error}]}."""
+    updates: list of {"path": str, "updates": dict, "merge_arrays": bool,
+    "expected_revision": str} (merge_arrays defaults to True per entry).
+    One entry failing doesn't abort the rest — data.results holds one item per
+    entry ({success, path, revision} or {success: false, path, error}) and
+    data.summary the {total, succeeded, failed} tally."""
     result = patch_frontmatter_batch(updates, index=_index)
-    for entry in result.get("succeeded", []):
-        log_write("patch_frontmatter_batch_tool", entry.get("path"), f"updated keys: {entry.get('updated_keys')}")
-    return result
+    for entry in result["results"]:
+        if entry.get("success"):
+            log_write(
+                "patch_frontmatter_batch_tool",
+                entry.get("path"),
+                f"updated keys: {entry.get('data', {}).get('updated_keys')}",
+            )
+    return batch_result(result["results"], result["summary"])
 
 
 @mcp.tool()
@@ -1070,7 +1187,7 @@ def manage_tags_tool(
         path, add=add, remove=remove, index=_index, expected_revision=expected_revision
     )
     log_write("manage_tags_tool", path, f"+{add or []} -{remove or []}")
-    return result
+    return _write_envelope(result)
 
 
 def move_note_tool(from_path: str, to_path: str, vault: str | None = None) -> dict:
@@ -1078,7 +1195,7 @@ def move_note_tool(from_path: str, to_path: str, vault: str | None = None) -> di
     that reference the old path. Returns {from, to, updated_links_in}."""
     result = move_note(from_path, to_path, index=_index)
     log_write("move_note_tool", to_path, f"moved from {from_path}")
-    return result
+    return _write_envelope(result, path_key="to", action="moved")
 
 
 if _feature_flags.enable_move:
@@ -1088,21 +1205,23 @@ if _feature_flags.enable_move:
 # ── Query / Graph ─────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def get_backlinks_tool(path: str, vault: str | None = None) -> list[str]:
-    """Return all notes that link to the given note (alias-aware)."""
-    return get_backlinks(path, _index)
+def get_backlinks_tool(path: str, vault: str | None = None) -> dict:
+    """Return all notes that link to the given note (alias-aware).
+    data.items is a list of note paths."""
+    return list_result(get_backlinks(path, _index))
 
 
 @mcp.tool()
-def get_notes_by_tag_tool(tag: str, vault: str | None = None) -> list[str]:
-    """Return all notes that have the given tag."""
-    return get_notes_by_tag(tag, _index)
+def get_notes_by_tag_tool(tag: str, vault: str | None = None) -> dict:
+    """Return all notes that have the given tag. data.items is a list of paths."""
+    return list_result(get_notes_by_tag(tag, _index))
 
 
 @mcp.tool()
-def get_vault_conventions_tool(vault: str | None = None) -> str:
-    """Return the vault's AI instructions / conventions from _AI_INSTRUCTIONS.md."""
-    return get_vault_conventions()
+def get_vault_conventions_tool(vault: str | None = None) -> dict:
+    """Return the vault's AI instructions / conventions from _AI_INSTRUCTIONS.md.
+    data.conventions is the raw Markdown."""
+    return read_result(None, {"conventions": get_vault_conventions()})
 
 
 @mcp.tool()
@@ -1118,39 +1237,43 @@ def get_audit_log_tool(
     path/tool/since are optional filters (since: ISO timestamp, inclusive).
     Entries: {timestamp, tool, path, summary}. Covers the core note/folder
     write tools; canvas/kanban/excalidraw/bases writes aren't logged yet."""
-    return get_audit_log(path=path, tool=tool, since=since, limit=limit)
+    entries = get_audit_log(path=path, tool=tool, since=since, limit=limit)
+    return list_result(entries, meta={"truncated": len(entries) >= limit})
 
 
 @mcp.tool()
-def get_note_history_tool(path: str, limit: int = 20, vault: str | None = None) -> list[dict]:
+def get_note_history_tool(path: str, limit: int = 20, vault: str | None = None) -> dict:
     """Audit-log entries for one specific note, most recent first —
     what changed and when, without needing to know which tool was used."""
-    return get_note_history(path, limit=limit)
+    return list_result(get_note_history(path, limit=limit))
 
 
 @mcp.tool()
-def list_vaults_tool() -> list[dict]:
+def list_vaults_tool() -> dict:
     """List the vault(s) the current identity (API key or GitHub login) may
     access. Returns [{name, description, is_default}]. Call this at the
     start of a session whenever more than one vault comes back — pass
     vault=<name> on any other tool to operate on a non-default one for that
     single call; omit it to use whichever entry has is_default=true. In
     single-vault mode (no VAULTS_CONFIG) this always returns exactly one
-    entry with is_default=true — there's nothing to choose between."""
+    entry with is_default=true — there's nothing to choose between.
+    data.items: [{name, description, is_default}]."""
     cfg = get_config()
     if not cfg.multi_vault:
         vault = cfg.vaults[cfg.default_vault_name]
-        return [{"name": vault.name, "description": vault.description, "is_default": True}]
+        return list_result(
+            [{"name": vault.name, "description": vault.description, "is_default": True}]
+        )
 
     identity = _resolve_identity(cfg)
-    return [
+    return list_result([
         {
             "name": name,
             "description": cfg.vaults[name].description,
             "is_default": name == identity.default,
         }
         for name in identity.vaults
-    ]
+    ])
 
 
 @mcp.tool()
@@ -1163,21 +1286,23 @@ def lint_schema_tool(vault: str | None = None) -> dict:
     note isn't a violation, only a present value outside the declared enum
     is. Returns an empty schema/violations pair if no enum schema can be
     parsed from _AI_INSTRUCTIONS.md."""
-    return lint_schema(_index)
+    return read_result(None, lint_schema(_index))
 
 
 @mcp.tool()
-def get_broken_links_tool(vault: str | None = None) -> list[dict]:
+def get_broken_links_tool(vault: str | None = None) -> dict:
     """Find all wikilinks in the vault that point to non-existent notes.
-    Returns [{source, link}]."""
-    return get_broken_links(_index)
+    data.items: [{source, link}]."""
+    return list_result(get_broken_links(_index))
 
 
 @mcp.tool()
-def get_orphans_tool(exclude_folders: list[str] | None = None, vault: str | None = None) -> list[str]:
+def get_orphans_tool(exclude_folders: list[str] | None = None, vault: str | None = None) -> dict:
     """Find notes that no other note links to.
-    Excludes Journal and Templates by default."""
-    return get_orphans(_index, exclude_folders=exclude_folders or ["Journal", "Templates"])
+    Excludes Journal and Templates by default. data.items is a list of paths."""
+    return list_result(
+        get_orphans(_index, exclude_folders=exclude_folders or ["Journal", "Templates"])
+    )
 
 
 @mcp.tool()
@@ -1189,29 +1314,36 @@ def get_link_graph_tool(
 ) -> dict:
     """Return a traversable link graph starting from a note.
     direction: 'outgoing' | 'incoming' | 'both'.
-    Returns {root, nodes: [{path, title, tags}], edges: [{from, to, type}]}."""
-    return get_link_graph(root, _index, depth=depth, direction=direction)
+    `path` is the resolved root note; data: {nodes: [{path, title, tags}],
+    edges: [{from, to, type}]}."""
+    result = get_link_graph(root, _index, depth=depth, direction=direction)
+    return read_result(
+        result.get("root", root),
+        {key: value for key, value in result.items() if key != "root"},
+        meta={"depth": depth, "direction": direction},
+    )
 
 
 @mcp.tool()
 def get_vault_stats_tool(vault: str | None = None) -> dict:
     """Return vault statistics: note count, link count, orphans, broken links,
-    most-linked notes."""
-    return get_vault_stats(_index)
+    most-linked notes. Vault-wide, so the envelope carries no `path`."""
+    return read_result(None, get_vault_stats(_index))
 
 
 @mcp.tool()
 def get_tag_tree_tool(vault: str | None = None) -> dict:
-    """Return all tags as a nested tree (e.g. konzept → python, ki → llm)."""
-    return get_tag_tree(_index)
+    """Return all tags as a nested tree (e.g. konzept → python, ki → llm).
+    data.tree is the nested mapping."""
+    return read_result(None, {"tree": get_tag_tree(_index)})
 
 
 @mcp.tool()
-def list_all_tags_tool(sort_by: str = "count", vault: str | None = None) -> list[dict]:
+def list_all_tags_tool(sort_by: str = "count", vault: str | None = None) -> dict:
     """Return all tags in the vault with note counts.
     sort_by: 'count' (descending, default) | 'name' (alphabetical).
-    Returns [{tag, count}]."""
-    return list_all_tags(_index, sort_by=sort_by)
+    data.items: [{tag, count}]."""
+    return list_result(list_all_tags(_index, sort_by=sort_by))
 
 
 @mcp.tool()
@@ -1222,23 +1354,26 @@ def get_tasks_tool(
     due_before: str | None = None,
     due_after: str | None = None,
     vault: str | None = None,
-) -> list[dict]:
+) -> dict:
     """Return tasks from across the vault.
     status: 'open' | 'done' | 'all'. Optionally filter by folder or tag.
     due_before/due_after: 'YYYY-MM-DD', inclusive; matches the Tasks-plugin
     📅 due date (tasks without one never match either filter).
     Parses Tasks-plugin emoji markers: 📅 due, ✅ done date, 🔁 recurrence,
     ⏫/🔼/🔽 priority (high/medium/low) — stripped from `text` into their own fields.
-    Returns [{text, done, source, line, due, recurrence, priority, done_date}]."""
-    return get_tasks(_index, status=status, folder=folder, tag=tag, due_before=due_before, due_after=due_after)
+    data.items: [{text, done, source, line, due, recurrence, priority, done_date}]."""
+    return list_result(
+        get_tasks(_index, status=status, folder=folder, tag=tag, due_before=due_before, due_after=due_after)
+    )
 
 
 @mcp.tool()
 def get_daily_note_tool(date: str = "today", vault: str | None = None) -> dict:
     """Read a daily note from Journal/.
     date: 'today' | 'yesterday' | 'YYYY-MM-DD'.
-    Returns {path, exists, content, frontmatter, tasks}."""
-    return get_daily_note(_index, date_str=date)
+    data: {exists, content, frontmatter, tasks}."""
+    result = get_daily_note(_index, date_str=date)
+    return _read_envelope(result.get("path"), result)
 
 
 @mcp.tool()
@@ -1246,15 +1381,17 @@ def get_periodic_note_tool(period: str = "daily", date: str = "today", vault: st
     """Read or preview a periodic note.
     period: 'daily' | 'weekly' | 'monthly' | 'quarterly' | 'yearly'.
     date: 'today' | 'yesterday' | 'YYYY-MM-DD'.
-    Returns {path, period, date, exists, content, frontmatter, tasks}."""
-    return get_periodic_note(_index, period=period, date_str=date)
+    data: {period, date, exists, content, frontmatter, tasks}."""
+    result = get_periodic_note(_index, period=period, date_str=date)
+    return _read_envelope(result.get("path"), result)
 
 
 @mcp.tool()
-def resolve_alias_tool(name: str, vault: str | None = None) -> str | None:
+def resolve_alias_tool(name: str, vault: str | None = None) -> dict:
     """Resolve a note alias or stem to its real vault path.
-    Returns None if not found."""
-    return resolve_alias(name, _index)
+    `path` and data.resolved are null (and `path` omitted) if not found."""
+    resolved = resolve_alias(name, _index)
+    return read_result(resolved, {"name": name, "resolved": resolved})
 
 
 @mcp.tool()
@@ -1268,12 +1405,12 @@ def query_notes_tool(
     limit: int = 50,
     folder: str = "",
     vault: str | None = None,
-) -> list[dict]:
+) -> dict:
     """Dataview-like query: filter notes by tags, status, frontmatter, or inline fields.
     tags: all must match (AND). sort_by: 'path'|'title'|'created'|'mtime'.
     inline_field_filter: match Dataview inline fields (key:: value syntax).
-    Returns [{path, title, tags, status, created, mtime, frontmatter, inline_fields}]."""
-    return query_notes(
+    data.items: [{path, title, tags, status, created, mtime, frontmatter, inline_fields}]."""
+    items = query_notes(
         _index,
         tags=tags,
         status=status,
@@ -1284,29 +1421,31 @@ def query_notes_tool(
         limit=limit,
         folder=folder,
     )
+    return list_result(items, meta={"truncated": len(items) >= limit})
 
 
 # ── Attachments ───────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def list_attachments_tool(folder: str = "", vault: str | None = None) -> list[dict]:
+def list_attachments_tool(folder: str = "", vault: str | None = None) -> dict:
     """List all non-Markdown files in the vault: images, PDFs, audio, etc.
-    Returns [{path, size_bytes, mime_type, mtime}]."""
-    return list_attachments(folder)
+    data.items: [{path, size_bytes, mime_type, mtime}]."""
+    return list_result(list_attachments(folder))
 
 
 @mcp.tool()
 def read_attachment_tool(path: str, vault: str | None = None) -> dict:
-    """Read an attachment file. Text files returned as UTF-8 string.
-    Binary files (images, PDFs) returned as base64-encoded content with mime_type."""
-    return read_attachment(path)
+    """Read an attachment file. data.content is a UTF-8 string for text files,
+    or base64-encoded bytes for binary ones (images, PDFs) — data.mime_type
+    and data.encoding say which."""
+    return _read_envelope(path, read_attachment(path))
 
 
 @mcp.tool()
 def add_attachment_tool(path: str, content_base64: str, vault: str | None = None) -> dict:
     """Write a binary attachment (image, PDF, etc.) to the vault from base64-encoded content.
-    Returns {path, status, size_bytes, mime_type}."""
-    return add_attachment(path, content_base64)
+    data: {size_bytes, mime_type}."""
+    return _write_envelope(add_attachment(path, content_base64))
 
 
 @mcp.tool()
@@ -1316,7 +1455,7 @@ def create_attachment_token_tool(path: str, method: str = "PUT", expires_in: int
     server's master API_KEY. method: 'PUT' (upload) or 'GET' (download).
     expires_in: seconds until the token expires (default 300, max 3600).
 
-    Returns {path, method, vault, expires_at, sig, url?}. If the server has
+    If the server has
     PUBLIC_BASE_URL configured, `url` is the ready-to-use request URL — use
     it as-is, it already has everything this token needs (including
     ?vault= when relevant) baked in. Otherwise build it yourself as:
@@ -1329,7 +1468,8 @@ def create_attachment_token_tool(path: str, method: str = "PUT", expires_in: int
     have no static secret of their own to sign with; use a plain
     Authorization: Bearer request against /attachments/* instead (that path
     works for any identity type, but needs ?vault=<name> added by hand if
-    targeting a non-default vault, since nothing was pre-signed for it)."""
+    targeting a non-default vault, since nothing was pre-signed for it).
+    data: {method, vault, expires_at, sig, url?}."""
     cfg = get_config()
     vault_name = cfg.resolve_vault_name()
     if cfg.multi_vault:
@@ -1346,8 +1486,11 @@ def create_attachment_token_tool(path: str, method: str = "PUT", expires_in: int
         signing_key = cfg.api_key
         if not signing_key:
             raise ValueError("API_KEY is not configured on this server; attachment tokens require it")
-    return create_attachment_token(
-        path, signing_key=signing_key, vault=vault_name, method=method, expires_in=expires_in
+    return _read_envelope(
+        path,
+        create_attachment_token(
+            path, signing_key=signing_key, vault=vault_name, method=method, expires_in=expires_in
+        ),
     )
 
 
@@ -1524,9 +1667,10 @@ async def attachment_route(request: Request) -> Response:
 # ── Templates ─────────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def list_templates_tool(vault: str | None = None) -> list[str]:
-    """List all template files in the Templates/ folder."""
-    return list_templates()
+def list_templates_tool(vault: str | None = None) -> dict:
+    """List all template files in the Templates/ folder.
+    data.items is a list of template paths."""
+    return list_result(list_templates())
 
 
 @mcp.tool()
@@ -1543,14 +1687,18 @@ def create_from_template_tool(
     Built-in variables: {{date}}, {{time}}, {{title}}, {{week}}, {{month}}, {{year}}, {{weekday}}.
     Supports format specs: {{date:YYYY-MM}} → '2026-07'.
     Custom variables passed in 'variables' dict override built-ins.
-    Unknown {{vars}} are preserved as-is."""
-    return create_from_template(
-        template_path,
-        output_path,
-        variables=variables,
-        index=_index,
-        expected_revision=expected_revision,
-        create_only=create_only,
+    Unknown {{vars}} are preserved as-is.
+    `path` is the written note; data: {template, variables}."""
+    return _write_envelope(
+        create_from_template(
+            template_path,
+            output_path,
+            variables=variables,
+            index=_index,
+            expected_revision=expected_revision,
+            create_only=create_only,
+        ),
+        path_key="output",
     )
 
 
@@ -1559,15 +1707,16 @@ def create_from_template_tool(
 if _feature_flags.enable_canvas:
 
     @mcp.tool()
-    def list_canvases_tool(vault: str | None = None) -> list[str]:
-        """List all Obsidian Canvas (.canvas) files in the vault."""
-        return list_canvases()
+    def list_canvases_tool(vault: str | None = None) -> dict:
+        """List all Obsidian Canvas (.canvas) files in the vault.
+        data.items is a list of .canvas paths."""
+        return list_result(list_canvases())
 
     @mcp.tool()
     def read_canvas_tool(path: str, vault: str | None = None) -> dict:
         """Read an Obsidian Canvas file.
-        Returns {path, nodes: [{id, type, text, file, x, y}], edges: [{from, to, label}]}."""
-        return read_canvas(path)
+        data: {nodes: [{id, type, text, file, x, y}], edges: [{from, to, label}]}."""
+        return _read_envelope(path, read_canvas(path))
 
     @mcp.tool()
     @_mutation_boundary
@@ -1583,13 +1732,15 @@ if _feature_flags.enable_canvas:
         Node fields: type ('text'|'file'|'group'|'link'), x, y, width, height.
         Text nodes: text. File nodes: file (vault path). Link nodes: url.
         Edge fields: fromNode, toNode, label (optional). IDs are auto-generated if omitted.
-        Returns {path, status, nodes, edges}."""
-        return write_canvas(
-            path,
-            nodes=nodes,
-            edges=edges,
-            expected_revision=expected_revision,
-            create_only=create_only,
+        data: {nodes, edges} (counts)."""
+        return _write_envelope(
+            write_canvas(
+                path,
+                nodes=nodes,
+                edges=edges,
+                expected_revision=expected_revision,
+                create_only=create_only,
+            )
         )
 
     @mcp.tool()
@@ -1606,15 +1757,17 @@ if _feature_flags.enable_canvas:
     ) -> dict:
         """Atomically update an existing canvas without rewriting the whole file.
         update_nodes: each dict must include 'id'. delete_node_ids also removes
-        all edges connected to those nodes. Returns {path, status, nodes, edges}."""
-        return patch_canvas(
-            path,
-            add_nodes=add_nodes,
-            update_nodes=update_nodes,
-            delete_node_ids=delete_node_ids,
-            add_edges=add_edges,
-            delete_edge_ids=delete_edge_ids,
-            expected_revision=expected_revision,
+        all edges connected to those nodes. data: {nodes, edges} (counts)."""
+        return _write_envelope(
+            patch_canvas(
+                path,
+                add_nodes=add_nodes,
+                update_nodes=update_nodes,
+                delete_node_ids=delete_node_ids,
+                add_edges=add_edges,
+                delete_edge_ids=delete_edge_ids,
+                expected_revision=expected_revision,
+            )
         )
 
 
@@ -1623,15 +1776,16 @@ if _feature_flags.enable_canvas:
 if _feature_flags.enable_excalidraw:
 
     @mcp.tool()
-    def list_excalidraw_tool(vault: str | None = None) -> list[str]:
-        """List all Obsidian Excalidraw (*.excalidraw.md) files in the vault."""
-        return list_excalidraw()
+    def list_excalidraw_tool(vault: str | None = None) -> dict:
+        """List all Obsidian Excalidraw (*.excalidraw.md) files in the vault.
+        data.items is a list of *.excalidraw.md paths."""
+        return list_result(list_excalidraw())
 
     @mcp.tool()
     def read_excalidraw_tool(path: str, vault: str | None = None) -> dict:
         """Read an Obsidian Excalidraw file.
-        Returns {path, elements, app_state, files}."""
-        return read_excalidraw(path)
+        data: {elements, app_state, files}."""
+        return _read_envelope(path, read_excalidraw(path))
 
     @mcp.tool()
     @_mutation_boundary
@@ -1646,14 +1800,16 @@ if _feature_flags.enable_excalidraw:
         """Create or fully overwrite an Excalidraw file.
         Element fields: type ('rectangle'|'ellipse'|'text'|'arrow'|'freedraw'|...), x, y,
         width, height. Element 'id' is auto-generated if omitted.
-        Returns {path, status, elements}."""
-        return write_excalidraw(
-            path,
-            elements=elements,
-            app_state=app_state,
-            index=_index,
-            expected_revision=expected_revision,
-            create_only=create_only,
+        data: {elements} (count)."""
+        return _write_envelope(
+            write_excalidraw(
+                path,
+                elements=elements,
+                app_state=app_state,
+                index=_index,
+                expected_revision=expected_revision,
+                create_only=create_only,
+            )
         )
 
     @mcp.tool()
@@ -1668,14 +1824,16 @@ if _feature_flags.enable_excalidraw:
     ) -> dict:
         """Atomically update an existing Excalidraw file without rewriting the whole file.
         update_elements: each dict must include 'id'.
-        Returns {path, status, elements}."""
-        return patch_excalidraw(
-            path,
-            add_elements=add_elements,
-            update_elements=update_elements,
-            delete_element_ids=delete_element_ids,
-            index=_index,
-            expected_revision=expected_revision,
+        data: {elements} (count)."""
+        return _write_envelope(
+            patch_excalidraw(
+                path,
+                add_elements=add_elements,
+                update_elements=update_elements,
+                delete_element_ids=delete_element_ids,
+                index=_index,
+                expected_revision=expected_revision,
+            )
         )
 
 
@@ -1686,8 +1844,8 @@ if _feature_flags.enable_kanban:
     @mcp.tool()
     def read_kanban_tool(path: str, vault: str | None = None) -> dict:
         """Read an Obsidian Kanban board (requires kanban-plugin in frontmatter).
-        Returns {path, plugin, columns: [{name, cards: [{text, done}]}], total_cards}."""
-        return read_kanban(path)
+        data: {plugin, columns: [{name, cards: [{text, done}]}], total_cards}."""
+        return _read_envelope(path, read_kanban(path))
 
     @mcp.tool()
     @_mutation_boundary
@@ -1699,13 +1857,15 @@ if _feature_flags.enable_kanban:
         vault: str | None = None,
     ) -> dict:
         """Create a new Kanban board with the given column names.
-        Returns {path, status, columns}."""
-        return create_kanban_board(
-            path,
-            columns,
-            index=_index,
-            expected_revision=expected_revision,
-            create_only=create_only,
+        data: {columns}."""
+        return _write_envelope(
+            create_kanban_board(
+                path,
+                columns,
+                index=_index,
+                expected_revision=expected_revision,
+                create_only=create_only,
+            )
         )
 
     @mcp.tool()
@@ -1719,14 +1879,16 @@ if _feature_flags.enable_kanban:
         vault: str | None = None,
     ) -> dict:
         """Add a card to a Kanban column. Card is inserted at the top of the column.
-        Returns {path, status, column, card, done}."""
-        return add_kanban_card(
-            path,
-            column,
-            text,
-            done=done,
-            index=_index,
-            expected_revision=expected_revision,
+        data: {column, card, done}."""
+        return _write_envelope(
+            add_kanban_card(
+                path,
+                column,
+                text,
+                done=done,
+                index=_index,
+                expected_revision=expected_revision,
+            )
         )
 
     @mcp.tool()
@@ -1741,15 +1903,17 @@ if _feature_flags.enable_kanban:
         vault: str | None = None,
     ) -> dict:
         """Move a card from one column to another. done=true/false updates the tick state.
-        Returns {path, status, card, from, to}."""
-        return move_kanban_card(
-            path,
-            card_text,
-            from_column,
-            to_column,
-            done=done,
-            index=_index,
-            expected_revision=expected_revision,
+        data: {card, from, to}."""
+        return _write_envelope(
+            move_kanban_card(
+                path,
+                card_text,
+                from_column,
+                to_column,
+                done=done,
+                index=_index,
+                expected_revision=expected_revision,
+            )
         )
 
     @mcp.tool()
@@ -1762,13 +1926,15 @@ if _feature_flags.enable_kanban:
         vault: str | None = None,
     ) -> dict:
         """Delete a card from the Kanban board. column limits the search to one column.
-        Returns {path, status, card}."""
-        return delete_kanban_card(
-            path,
-            card_text,
-            column=column,
-            index=_index,
-            expected_revision=expected_revision,
+        data: {card}."""
+        return _write_envelope(
+            delete_kanban_card(
+                path,
+                card_text,
+                column=column,
+                index=_index,
+                expected_revision=expected_revision,
+            )
         )
 
 
@@ -1777,15 +1943,16 @@ if _feature_flags.enable_kanban:
 if _feature_flags.enable_bases:
 
     @mcp.tool()
-    def list_bases_tool(vault: str | None = None) -> list[str]:
-        """List all Obsidian Bases (.base) files in the vault."""
-        return list_bases()
+    def list_bases_tool(vault: str | None = None) -> dict:
+        """List all Obsidian Bases (.base) files in the vault.
+        data.items is a list of .base paths."""
+        return list_result(list_bases())
 
     @mcp.tool()
     def read_base_tool(path: str, vault: str | None = None) -> dict:
         """Read an Obsidian Bases file.
-        Returns {path, filters, formulas, properties, views}."""
-        return read_base(path)
+        data: {filters, formulas, properties, views}."""
+        return _read_envelope(path, read_base(path))
 
     @mcp.tool()
     @_mutation_boundary
@@ -1805,17 +1972,19 @@ if _feature_flags.enable_bases:
         formulas: name -> expression string. properties: name -> {displayName}.
         views: list of {type, name, limit, filters, order, groupBy, summaries};
         'type' (e.g. 'table'|'cards'|'list') is required per view.
-        Returns {path, status, views, known_properties} — known_properties is
-        collected from existing .base files in the vault to keep naming consistent."""
-        return write_base(
-            path,
-            filters=filters,
-            formulas=formulas,
-            properties=properties,
-            views=views,
-            index=_index,
-            expected_revision=expected_revision,
-            create_only=create_only,
+        data: {views, known_properties} — known_properties is collected from
+        existing .base files in the vault to keep naming consistent."""
+        return _write_envelope(
+            write_base(
+                path,
+                filters=filters,
+                formulas=formulas,
+                properties=properties,
+                views=views,
+                index=_index,
+                expected_revision=expected_revision,
+                create_only=create_only,
+            )
         )
 
     @mcp.tool()
@@ -1836,19 +2005,21 @@ if _feature_flags.enable_bases:
         """Atomically update an existing .base file without rewriting it wholesale.
         update_formulas/update_properties are merged by key. set_filters replaces
         the whole filters block. update_views: each dict must include 'name'.
-        Returns {path, status, views}."""
-        return patch_base(
-            path,
-            update_formulas=update_formulas,
-            delete_formula_keys=delete_formula_keys,
-            update_properties=update_properties,
-            delete_property_keys=delete_property_keys,
-            set_filters=set_filters,
-            add_views=add_views,
-            update_views=update_views,
-            delete_view_names=delete_view_names,
-            index=_index,
-            expected_revision=expected_revision,
+        data: {views} (count)."""
+        return _write_envelope(
+            patch_base(
+                path,
+                update_formulas=update_formulas,
+                delete_formula_keys=delete_formula_keys,
+                update_properties=update_properties,
+                delete_property_keys=delete_property_keys,
+                set_filters=set_filters,
+                add_views=add_views,
+                update_views=update_views,
+                delete_view_names=delete_view_names,
+                index=_index,
+                expected_revision=expected_revision,
+            )
         )
 
 
@@ -1858,19 +2029,21 @@ if _feature_flags.enable_bases:
 def list_folder_tool(path: str = "", recursive: bool = False, max_depth: int | None = None, vault: str | None = None) -> dict:
     """List the contents of a vault folder (non-hidden items only).
     path='': root of the vault.
-    recursive=False (default): immediate contents only — {path, folders, files}.
-    recursive=True: full tree dump in one call — {path, tree: {folders: {name: tree}, files: [...]}}.
+    recursive=False (default): immediate contents only — data: {folders, files}.
+    recursive=True: full tree dump in one call — data: {tree: {folders: {name: tree}, files: [...]}}.
     max_depth limits how many levels deep to descend (None = unlimited)."""
-    return list_folder(path, recursive=recursive, max_depth=max_depth)
+    result = list_folder(path, recursive=recursive, max_depth=max_depth)
+    return _read_envelope(result.get("path", path), result, meta={"recursive": recursive})
 
 
 @mcp.tool()
-def list_files_tool(folder: str = "", extension: str | None = None, vault: str | None = None) -> list[str]:
+def list_files_tool(folder: str = "", extension: str | None = None, vault: str | None = None) -> dict:
     """List every file in the vault (or a subfolder), any type — not just
     notes/attachments/bases/canvases (e.g. .lock files, stray non-Markdown
     files). extension filters by suffix without the dot (e.g. "lock",
-    "canvas"); omit for everything. Hidden files/folders are skipped."""
-    return list_files(folder, extension=extension)
+    "canvas"); omit for everything. Hidden files/folders are skipped.
+    data.items is a list of vault-relative paths."""
+    return list_result(list_files(folder, extension=extension))
 
 
 @mcp.tool()
@@ -1879,7 +2052,7 @@ def create_folder_tool(path: str, vault: str | None = None) -> dict:
     Returns {path, status}."""
     result = create_folder(path)
     log_write("create_folder_tool", path, "created folder")
-    return result
+    return _write_envelope(result)
 
 
 def delete_folder_tool(path: str, trash: bool = True, vault: str | None = None) -> dict:
@@ -1888,7 +2061,7 @@ def delete_folder_tool(path: str, trash: bool = True, vault: str | None = None) 
     Returns {path, status, trash}."""
     result = delete_folder(path, trash=trash)
     log_write("delete_folder_tool", path, f"deleted folder (trash={trash})")
-    return result
+    return _write_envelope(result)
 
 
 if _feature_flags.enable_delete:
@@ -1901,7 +2074,7 @@ def rename_folder_tool(from_path: str, to_path: str, vault: str | None = None) -
     Returns {from, to, notes_moved, updated_links_in}."""
     result = rename_folder(from_path, to_path, index=_index)
     log_write("rename_folder_tool", to_path, f"renamed from {from_path}")
-    return result
+    return _write_envelope(result, path_key="to", action="renamed")
 
 
 if _feature_flags.enable_folder_rename:
@@ -1912,8 +2085,8 @@ def list_trash_tool(vault: str | None = None) -> dict:
     """List items sitting in .trash/ (from delete_note_tool/delete_folder_tool
     with trash=True). Names here are what restore_note_tool/restore_folder_tool
     expect as trashed_name.
-    Returns {items: [{name, type, size_bytes, mtime}]}."""
-    return list_trash()
+    data.items: [{name, type, size_bytes, mtime}]."""
+    return list_result(list_trash()["items"])
 
 
 if _feature_flags.enable_delete:
@@ -1927,7 +2100,7 @@ def restore_folder_tool(trashed_name: str, to_path: str, vault: str | None = Non
     Returns {path, status, notes_restored}."""
     result = restore_folder(trashed_name, to_path, index=_index)
     log_write("restore_folder_tool", to_path, f"restored from .trash/{trashed_name}")
-    return result
+    return _write_envelope(result)
 
 
 if _feature_flags.enable_delete:
