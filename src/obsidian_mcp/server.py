@@ -25,7 +25,9 @@ from .config import (
     ConfigError,
     get_config,
     load_vaults_file,
+    reset_current_identity,
     reset_current_vault,
+    set_current_identity,
     set_current_vault,
 )
 from .domain.index import VaultIndex
@@ -755,9 +757,11 @@ class VaultResolutionMiddleware(Middleware):
         vault_name = _select_vault(identity, requested)
 
         token = set_current_vault(vault_name)
+        identity_token = set_current_identity(identity)
         try:
             return await call_next(context)
         finally:
+            reset_current_identity(identity_token)
             reset_current_vault(token)
 
     async def on_read_resource(self, context: MiddlewareContext, call_next):
@@ -769,9 +773,11 @@ class VaultResolutionMiddleware(Middleware):
         vault_name = _select_vault(identity, None)
 
         token = set_current_vault(vault_name)
+        identity_token = set_current_identity(identity)
         try:
             return await call_next(context)
         finally:
+            reset_current_identity(identity_token)
             reset_current_vault(token)
 
 
@@ -1573,17 +1579,26 @@ async def _check_bearer_token(request: Request, cfg) -> AccessToken | None:
 
 
 def _check_scoped_token(request: Request, cfg, method: str, path: str) -> str | None:
+    """The vault name from _scoped_token_grant(), without the identity."""
+    return _scoped_token_grant(request, cfg, method, path)[0]
+
+
+def _scoped_token_grant(
+    request: Request, cfg, method: str, path: str
+) -> tuple[str | None, object | None]:
     """Returns the vault name a valid scoped token (?exp=&sig=[&vault=])
     grants access to for this exact path+method, or None if missing/
     invalid/expired. Tries every api_key identity's own value as the HMAC
     signing key in multi-vault mode (there's no bearer header here to say
     up front which identity minted it), or the single global API_KEY in
     single-vault mode. A key matching the signature but not actually
-    allowed the requested vault is treated the same as no match."""
+    allowed the requested vault is treated the same as no match. The matched
+    identity comes back alongside the vault name so the request runs under
+    that identity's own path policy."""
     exp = request.query_params.get("exp")
     sig = request.query_params.get("sig")
     if not exp or not sig:
-        return None
+        return None, None
     vault_param = request.query_params.get("vault", cfg.default_vault_name)
 
     if cfg.multi_vault:
@@ -1596,8 +1611,8 @@ def _check_scoped_token(request: Request, cfg, method: str, path: str) -> str | 
             continue
         if identity is not None and vault_param not in identity.vaults:
             continue
-        return vault_param
-    return None
+        return vault_param, identity
+    return None, None
 
 
 @mcp.custom_route("/health", methods=["GET"])
@@ -1660,6 +1675,7 @@ async def attachment_route(request: Request) -> Response:
     # Authenticate and choose a vault before any path-policy check so callers
     # cannot probe protected path boundaries through response differences.
     vault_name: str | None = None
+    identity = None
     access_token = await _check_bearer_token(request, cfg)
     if access_token is not None:
         if cfg.multi_vault:
@@ -1672,12 +1688,13 @@ async def attachment_route(request: Request) -> Response:
         else:
             vault_name = cfg.default_vault_name
     else:
-        vault_name = _check_scoped_token(request, cfg, method, path)
+        vault_name, identity = _scoped_token_grant(request, cfg, method, path)
 
     if vault_name is None:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
 
     context_token = set_current_vault(vault_name)
+    identity_token = set_current_identity(identity)
     try:
         storage = VaultStorage.from_config(cfg)
         try:
@@ -1724,6 +1741,7 @@ async def attachment_route(request: Request) -> Response:
             return JSONResponse({"error": "forbidden"}, status_code=403)
         return JSONResponse(result)
     finally:
+        reset_current_identity(identity_token)
         reset_current_vault(context_token)
 
 
@@ -2180,7 +2198,12 @@ def main() -> None:
     for name, vault in _cfg.vaults.items():
         context_token = set_current_vault(name)
         try:
-            policy = VaultAccessPolicy.from_config(_cfg)
+            # The index and watcher are shared by every identity, so their
+            # policy stays the vault's own: per-identity read scoping is a
+            # per-call filter on results, not a narrower index.
+            policy = VaultAccessPolicy.from_config(
+                _cfg, apply_identity_overrides=False
+            )
         finally:
             reset_current_vault(context_token)
         VaultStorage(policy).probe_create_only_support()

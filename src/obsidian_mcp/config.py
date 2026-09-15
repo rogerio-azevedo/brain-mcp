@@ -18,7 +18,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 
-from .storage.policy import VaultPathError, normalise_path_rules, path_rules_from_env
+from .storage.policy import (
+    EffectiveAccessPolicy,
+    PolicyMergeError,
+    VaultPathError,
+    normalise_path_rules,
+    path_rules_from_env,
+)
 
 
 class ConfigError(Exception):
@@ -57,6 +63,34 @@ class VaultEntry:
 
 
 @dataclass(frozen=True)
+class PolicyOverride:
+    """A per-identity narrowing of one vault's five path-policy fields.
+
+    ``None`` means "inherit the vault's value unchanged".  An override can
+    only ever restrict: allowlists intersect, denylists union, ``read_only``
+    ORs toward ``True`` (see ``storage.policy`` merge helpers).
+    """
+
+    write_paths: tuple[str, ...] | None = None
+    read_paths: tuple[str, ...] | None = None
+    deny_read_paths: tuple[str, ...] | None = None
+    deny_write_paths: tuple[str, ...] | None = None
+    read_only: bool | None = None
+
+    def is_empty(self) -> bool:
+        return all(
+            getattr(self, name) is None
+            for name in (
+                "write_paths",
+                "read_paths",
+                "deny_read_paths",
+                "deny_write_paths",
+                "read_only",
+            )
+        )
+
+
+@dataclass(frozen=True)
 class Identity:
     """One API key or GitHub login and the vaults it may access."""
 
@@ -64,10 +98,22 @@ class Identity:
     value: str
     vaults: tuple[str, ...]
     default: str | None = None
+    # Stored as pairs rather than a dict so Identity stays hashable/frozen.
+    overrides: tuple[tuple[str, PolicyOverride], ...] = ()
+
+    def override_for(self, vault_name: str) -> PolicyOverride | None:
+        """The policy override this identity has for one vault, if any."""
+        for name, override in self.overrides:
+            if name == vault_name:
+                return override
+        return None
 
 
 _current_vault_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "current_vault", default=None
+)
+_current_identity_var: contextvars.ContextVar[Identity | None] = contextvars.ContextVar(
+    "current_identity", default=None
 )
 
 
@@ -79,7 +125,107 @@ def reset_current_vault(token: contextvars.Token) -> None:
     _current_vault_var.reset(token)
 
 
-def load_vaults_file(path_str: str) -> tuple[dict[str, VaultEntry], tuple[Identity, ...]]:
+def set_current_identity(identity: Identity | None) -> contextvars.Token:
+    """Publish the request's resolved identity for policy resolution."""
+    return _current_identity_var.set(identity)
+
+
+def reset_current_identity(token: contextvars.Token) -> None:
+    _current_identity_var.reset(token)
+
+
+def current_identity() -> Identity | None:
+    """The identity this request resolved to, or ``None`` outside a request."""
+    return _current_identity_var.get()
+
+
+def _override_path_rules(value: object, *, name: str) -> tuple[str, ...] | None:
+    """Parse one optional override path list (absent/``None`` = inherit)."""
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)) or not all(
+        isinstance(item, str) for item in value
+    ):
+        raise ConfigError(f"{name} must be a list of strings")
+    if not value:
+        raise ConfigError(
+            f"{name} must list at least one path — omit the field to inherit "
+            "the vault's own value"
+        )
+    try:
+        return normalise_path_rules(value, name=name)
+    except VaultPathError as exc:
+        raise ConfigError(str(exc)) from exc
+
+
+_OVERRIDE_FIELDS = (
+    "write_paths",
+    "read_paths",
+    "deny_read_paths",
+    "deny_write_paths",
+    "read_only",
+)
+
+
+def _parse_policy_override(raw: object, *, name: str) -> PolicyOverride:
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{name} must be an object of policy overrides")
+    unknown = sorted(set(raw) - set(_OVERRIDE_FIELDS))
+    if unknown:
+        raise ConfigError(
+            f"{name} has unsupported override field(s): {', '.join(unknown)} "
+            f"(allowed: {', '.join(_OVERRIDE_FIELDS)})"
+        )
+    read_only = raw.get("read_only")
+    if read_only is not None and not isinstance(read_only, bool):
+        raise ConfigError(f"{name} read_only must be a boolean")
+    return PolicyOverride(
+        write_paths=_override_path_rules(
+            raw.get("write_paths"), name=f"{name} write_paths"
+        ),
+        read_paths=_override_path_rules(
+            raw.get("read_paths"), name=f"{name} read_paths"
+        ),
+        deny_read_paths=_override_path_rules(
+            raw.get("deny_read_paths"), name=f"{name} deny_read_paths"
+        ),
+        deny_write_paths=_override_path_rules(
+            raw.get("deny_write_paths"), name=f"{name} deny_write_paths"
+        ),
+        read_only=read_only,
+    )
+
+
+def _validate_override(
+    vault: VaultEntry,
+    override: PolicyOverride,
+    *,
+    identity_value: str,
+    global_read_only: bool,
+) -> None:
+    """Run one override through the merge helpers at load time.
+
+    A widening allowlist fails the server on boot rather than silently
+    under-enforcing on the first call.
+    """
+    base = EffectiveAccessPolicy(
+        read_only=global_read_only if vault.read_only is None else vault.read_only,
+        read_paths=vault.read_paths,
+        write_paths=vault.write_paths,
+        deny_read_paths=vault.deny_read_paths,
+        deny_write_paths=vault.deny_write_paths,
+    )
+    try:
+        base.merged_with(override)
+    except PolicyMergeError as exc:
+        raise ConfigError(
+            f"Identity {identity_value!r} override for vault {vault.name!r}: {exc}"
+        ) from exc
+
+
+def load_vaults_file(
+    path_str: str, *, global_read_only: bool = False
+) -> tuple[dict[str, VaultEntry], tuple[Identity, ...]]:
     """Parse and validate ``VAULTS_CONFIG`` JSON."""
     path = Path(path_str)
     if not path.is_file():
@@ -173,11 +319,32 @@ def load_vaults_file(path_str: str) -> tuple[dict[str, VaultEntry], tuple[Identi
         if identity_type == "github_login":
             value = value.lower()
         raw_identity_vaults = raw_identity.get("vaults", [])
-        if not isinstance(raw_identity_vaults, list) or not all(
+        overrides: list[tuple[str, PolicyOverride]] = []
+        if isinstance(raw_identity_vaults, dict):
+            # Object form: {vault_name: {policy override}}. Each override may
+            # only narrow that vault's own policy — validated below.
+            if not all(isinstance(key, str) for key in raw_identity_vaults):
+                raise ConfigError(
+                    f"Identity {value!r} 'vaults' object keys must be vault names"
+                )
+            identity_vaults = tuple(raw_identity_vaults)
+            for vault_name, raw_override in raw_identity_vaults.items():
+                override = _parse_policy_override(
+                    raw_override,
+                    name=f"Identity {value!r} vault {vault_name!r}",
+                )
+                if not override.is_empty():
+                    overrides.append((vault_name, override))
+        elif isinstance(raw_identity_vaults, list) and all(
             isinstance(item, str) for item in raw_identity_vaults
         ):
-            raise ConfigError(f"Identity {value!r} 'vaults' must be a list of strings")
-        identity_vaults = tuple(raw_identity_vaults)
+            # Array form: inherit each vault's policy exactly as before.
+            identity_vaults = tuple(raw_identity_vaults)
+        else:
+            raise ConfigError(
+                f"Identity {value!r} 'vaults' must be a list of strings or an "
+                "object mapping vault names to policy overrides"
+            )
         if not identity_vaults:
             raise ConfigError(f"Identity {value!r} in VAULTS_CONFIG has no 'vaults'")
         for vault_name in identity_vaults:
@@ -192,12 +359,20 @@ def load_vaults_file(path_str: str) -> tuple[dict[str, VaultEntry], tuple[Identi
             raise ConfigError(
                 f"Identity {value!r} default vault {default!r} is not in its own 'vaults' list"
             )
+        for vault_name, override in overrides:
+            _validate_override(
+                vaults[vault_name],
+                override,
+                identity_value=value,
+                global_read_only=global_read_only,
+            )
         identities.append(
             Identity(
                 type=identity_type,
                 value=value,
                 vaults=identity_vaults,
                 default=default,
+                overrides=tuple(overrides),
             )
         )
     return vaults, tuple(identities)
@@ -247,7 +422,9 @@ class Config:
         )
 
         if self.multi_vault:
-            vaults, identities = load_vaults_file(vaults_config_path)
+            vaults, identities = load_vaults_file(
+                vaults_config_path, global_read_only=self._global_read_only
+            )
             set_value(self, "vaults", MappingProxyType(vaults))
             set_value(self, "identities", identities)
             set_value(self, "default_vault_name", next(iter(vaults)))
