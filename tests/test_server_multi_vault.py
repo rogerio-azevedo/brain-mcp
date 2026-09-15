@@ -362,8 +362,9 @@ async def test_middleware_allows_vault_discovery_without_default(tmp_path, monke
     )
     result = await middleware.on_call_tool(context, call_next)
 
-    assert {item["name"] for item in result} == {"private", "monari"}
-    assert not any(item["is_default"] for item in result)
+    items = result["data"]["items"]
+    assert {item["name"] for item in items} == {"private", "monari"}
+    assert not any(item["is_default"] for item in items)
 
 
 # ── list_vaults_tool ─────────────────────────────────────────────────────
@@ -371,8 +372,9 @@ async def test_middleware_allows_vault_discovery_without_default(tmp_path, monke
 def test_list_vaults_tool_single_vault_mode(vault_factory):
     vault_factory({})
     result = list_vaults_tool()
-    assert len(result) == 1
-    assert result[0]["is_default"] is True
+    assert result["success"] is True
+    assert result["meta"]["count"] == 1
+    assert result["data"]["items"][0]["is_default"] is True
 
 
 def test_list_vaults_tool_multi_vault_mode(tmp_path, monkeypatch):
@@ -390,7 +392,7 @@ def test_list_vaults_tool_multi_vault_mode(tmp_path, monkeypatch):
     )
 
     result = list_vaults_tool()
-    names = {v["name"]: v["is_default"] for v in result}
+    names = {v["name"]: v["is_default"] for v in result["data"]["items"]}
     assert names == {"private": True, "monari": False}
 
 
@@ -400,6 +402,7 @@ def test_main_builds_policy_aware_index_and_watcher_per_vault(tmp_path, monkeypa
     data["vaults"]["private"]["read_paths"] = ["Memory/"]
     data["vaults"]["monari"]["write_paths"] = ["Output/"]
     config_path.write_text(json.dumps(data), encoding="utf-8")
+    (tmp_path / "b" / "Output").mkdir()
     monkeypatch.setenv("VAULTS_CONFIG", str(config_path))
     monkeypatch.setenv("TRANSPORT", "sse")
 
@@ -416,21 +419,32 @@ def test_main_builds_policy_aware_index_and_watcher_per_vault(tmp_path, monkeypa
             self.policy = policy
             created_indices[path.name] = self
 
-        def build(self):
+        def build(self, *, publish_ready=True):
+            self.publish_ready = publish_ready
             return None
 
         def update(self, _path):
             return None
 
+        def reconcile(self):
+            self.reconciled = True
+
+        def mark_ready(self):
+            self.ready = True
+
     class FakeWatcher:
-        def __init__(self, path, *, policy):
+        def __init__(self, path, *, debounce_ms, reconcile_interval, policy):
             self.path = path
+            self.debounce_ms = debounce_ms
+            self.reconcile_interval = reconcile_interval
             self.policy = policy
             self.callback = None
+            self.reconcile_callback = None
             created_watchers[path.name] = self
 
-        def start(self, *, on_change):
+        def start(self, *, on_change, on_reconcile):
             self.callback = on_change
+            self.reconcile_callback = on_reconcile
 
     class FakeThread:
         def __init__(self, *, target, daemon):
@@ -456,3 +470,7 @@ def test_main_builds_policy_aware_index_and_watcher_per_vault(tmp_path, monkeypa
     assert created_indices["b"].policy.write_paths == ("Output/",)
     assert created_watchers["a"].policy is created_indices["a"].policy
     assert created_watchers["b"].policy is created_indices["b"].policy
+    assert created_indices["a"].publish_ready is False
+    assert created_indices["a"].reconciled is True
+    assert created_indices["a"].ready is True
+    assert created_watchers["a"].reconcile_callback == created_indices["a"].reconcile

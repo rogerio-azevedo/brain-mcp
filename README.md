@@ -29,7 +29,7 @@ The intended setup is to host obsidian-mcp on a server or NAS where your vault i
 - **Folders** — list (optionally recursive with a full tree dump), create, delete, rename folders; renaming rewrites path-based wikilinks vault-wide
 - **Query & Graph** — backlinks, broken links, orphan detection, BFS link graph, vault stats, task collection across vault
 - **Dataview-like queries** — filter notes by tags, status, frontmatter fields (exact match or `$ne`/`$in`/`$nin`/`$exists` operators), or inline fields (`key:: value`)
-- **Audit log** — every write-tool call is recorded ({timestamp, tool, path, summary}); `get_audit_log_tool`/`get_note_history_tool` query it
+- **Audit log** — every write-tool call is recorded ({timestamp, tool, path, summary}); `get_audit_log_tool` queries it (pass `path=` for one note's history)
 - **Periodic Notes** — read/preview daily, weekly, monthly, quarterly, yearly journal notes from templates
 - **Canvas** *(opt-in via `ENABLE_CANVAS`)* — read, create, and patch Obsidian Canvas (`.canvas`) files
 - **Excalidraw** *(opt-in via `ENABLE_EXCALIDRAW`)* — read, create, and patch Obsidian Excalidraw (`*.excalidraw.md`) drawings
@@ -75,6 +75,8 @@ VAULT_PATH=/path/to/your/obsidian/vault
 # DENY_READ_PATHS=.obsidian/,.trash/ # security boundary for all reads
 # DENY_WRITE_PATHS=.obsidian/,.trash/,_AI_INSTRUCTIONS.md
 # ALLOW_PERMANENT_DELETE=false
+# REQUIRE_WRITE_PRECONDITIONS=true # require read revision before full overwrite
+# INDEX_RECONCILE_INTERVAL=900     # full Markdown hash sweep every 15 minutes
 # TRANSPORT=stdio           # stdio (default), http (recommended for network use), or sse (legacy)
 ```
 
@@ -104,6 +106,13 @@ only a discovery filter—not an access-control boundary. For example,
 `private/` hides that root directory and its descendants, while it does not
 hide `Projects/private/`.
 
+Revision-aware note mutation tools must read the target to determine existence,
+preserve frontmatter, calculate diffs, or derive an incremental edit. They
+therefore reject paths covered by `DENY_READ_PATHS` even if `WRITE_PATHS` also
+contains the path. Avoid overlapping those scopes for note workflows. The
+storage policy can still support intentionally write-only capabilities that do
+not inspect existing content, but `write_note_tool` is not one of them.
+
 The best-effort JSONL audit log is application state, not vault content. It
 defaults beneath `LOCK_PATH` for native runs and to `/data/audit.jsonl` in
 Docker. `AUDIT_LOG_PATH` must remain outside `VAULT_PATH`; the final log file
@@ -114,6 +123,21 @@ by the MCP process umask. Atomic overwrites preserve the existing file's
 permission bits. In a shared sync deployment, run the MCP and sync daemon with
 compatible UID/GID and umask settings so both can continue reading and updating
 new notes; the home-server profile exposes these as `PUID` and `PGID`.
+
+Direct note reads return an opaque `sha256:...` revision. Pass it as
+`expected_revision` when replacing or appending to an existing note so an edit
+landed by Obsidian Sync during the client's think time is reported as a conflict
+instead of silently overwritten. Network Compose configurations enable strict
+full-overwrite preconditions by default. Incremental patch/tag/frontmatter tools
+always protect the exact version they read internally. This is optimistic
+concurrency, not exactly-once execution: after a lost append response, re-read
+and verify the result before retrying without the old revision.
+
+Watcher events are debounced, and the index additionally hashes readable,
+indexable Markdown every 15 minutes by default to repair missed events. PDFs,
+images, other attachments, excluded paths, and Excalidraw files are not hashed.
+See [the design note](docs/implementation/phase-3-sync-concurrency.md) for the
+scope, measured cost, health fields, and remaining final-rename race.
 
 Full list of variables — including `API_KEY`, `PUBLIC_BASE_URL`, and the
 `OAUTH_GITHUB_*` variables for the optional second auth variant — is
@@ -138,7 +162,7 @@ for the two auth variants in detail.
 # ENABLE_MOVE=true             # move_note_tool
 # ENABLE_FOLDER_RENAME=true    # rename_folder_tool
 # ENABLE_BULK_REPLACE=true     # find_replace_in_vault_tool
-# ENABLE_DELETE=true           # delete_note_tool and delete_folder_tool
+# ENABLE_DELETE=true           # delete_tool, restore_tool and list_trash_tool
 ```
 
 Each defaults to `false`. A disabled group's tools aren't just refused at
@@ -201,7 +225,11 @@ The `docker-compose.yml` pulls the pre-built image from GHCR — no cloning or b
 GitHub OAuth state is stored under `/data/fastmcp` by default, inside the
 Compose `mcp-data` volume, so logins survive container restarts.
 
-The image has a built-in `HEALTHCHECK` against `GET /health` (unauthenticated, no vault content or filesystem paths — just `{status, index_ready}`), visible in `docker ps`/`docker compose ps`. Only meaningful for `TRANSPORT=http`/`sse`; a no-op for `stdio`.
+The image has a built-in `HEALTHCHECK` against `GET /health` (unauthenticated,
+with no vault content or filesystem paths). It reports index readiness plus the
+last reconciliation time, duration, and error, and is visible in
+`docker ps`/`docker compose ps`. Only meaningful for `TRANSPORT=http`/`sse`; a
+no-op for `stdio`.
 
 ### Hardened home-server Compose profile
 
@@ -361,7 +389,9 @@ etc.) automatically and redirects you to GitHub to log in on first connect.
 > claude.ai out and forces re-authentication. Set `FASTMCP_HOME` to a mounted
 > path (see `docker-compose.yml`) to avoid that.
 
-Keep the vault synced on the server with Syncthing, git+cron, rclone, or Obsidian Sync — obsidian-mcp picks up changes automatically via its file watcher.
+Keep the vault synced on the server with Syncthing, git+cron, rclone, or
+Obsidian Sync. The file watcher picks up normal changes, while periodic
+Markdown reconciliation repairs missed watcher events.
 
 ## Multi-Vault Setup
 
@@ -473,12 +503,12 @@ and any workflow rules.
 
 | Category | Tools |
 |---|---|
-| **Read** | `list_notes`, `read_note`, `search_notes`, `render_note`, `get_note_outline` |
-| **Write** | `write_note`, `patch_note`, `delete_note`*, `restore_note`*, `append_to_note`, `patch_frontmatter`, `manage_tags`, `move_note`, `find_replace_in_vault` |
-| **Folders** | `list_folder`, `create_folder`, `delete_folder`*, `restore_folder`*, `rename_folder`, `list_trash`* |
+| **Read** | `list_notes`, `read_note` (mode: full/outline/rendered), `search_notes` |
+| **Write** | `write_note`, `patch_note`, `delete`*, `restore`*, `append_to_note`, `patch_frontmatter` (one note or many), `manage_tags`, `move_note`, `find_replace_in_vault` |
+| **Folders** | `list_folder`, `create_folder`, `rename_folder`, `list_trash`* (folders are deleted/restored by `delete`*/`restore`*) |
 | **Query** | `query_notes`, `get_backlinks`, `get_broken_links`, `get_orphans`, `get_link_graph`, `get_vault_stats`, `get_tasks`, `resolve_alias` |
-| **Tags** | `get_notes_by_tag`, `get_tag_tree`, `list_all_tags` |
-| **Periodic** | `get_daily_note`, `get_periodic_note` |
+| **Tags** | `list_all_tags` (mode: flat/tree; notes for one tag: `query_notes(tags=[...])`) |
+| **Periodic** | `get_periodic_note` |
 | **Canvas** | `list_canvases`, `read_canvas`, `write_canvas`, `patch_canvas` |
 | **Excalidraw** | `list_excalidraw`, `read_excalidraw`, `write_excalidraw`, `patch_excalidraw` |
 | **Kanban** | `read_kanban`, `create_kanban_board`, `add_kanban_card`, `move_kanban_card`, `delete_kanban_card` |

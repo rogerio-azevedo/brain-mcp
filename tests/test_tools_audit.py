@@ -7,7 +7,7 @@ import pytest
 from obsidian_mcp.config import get_config
 from obsidian_mcp.storage.audit import append_entry, read_entries
 from obsidian_mcp.storage.policy import ReadPermissionError
-from obsidian_mcp.tools.audit import get_audit_log, get_note_history, log_write
+from obsidian_mcp.tools.audit import get_audit_log, log_write
 
 
 def test_log_write_then_get_audit_log(vault_factory):
@@ -86,12 +86,12 @@ def test_get_audit_log_empty_when_no_entries(vault_factory):
     assert get_audit_log() == []
 
 
-def test_get_note_history_scoped_to_path(vault_factory):
+def test_get_audit_log_scoped_to_path(vault_factory):
     vault_factory({})
     log_write("write_note_tool", "a.md", "wrote a")
     log_write("write_note_tool", "b.md", "wrote b")
     log_write("patch_frontmatter_tool", "a.md", "patched a")
-    history = get_note_history("a.md")
+    history = get_audit_log(path="a.md")
     assert len(history) == 2
     assert all(e["path"] == "a.md" for e in history)
 
@@ -132,7 +132,7 @@ def test_get_audit_log_applies_read_policy_before_limit(vault_factory, monkeypat
 
     assert [entry["path"] for entry in entries] == ["visible.md"]
     with pytest.raises(ReadPermissionError):
-        get_note_history("private/secret.md")
+        get_audit_log(path="private/secret.md")
 
 
 def test_log_write_never_raises_on_bad_vault(monkeypatch):

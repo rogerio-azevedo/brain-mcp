@@ -20,10 +20,6 @@ def get_backlinks(path: str, index: VaultIndex) -> list[str]:
     return index.get_backlinks(path)
 
 
-def get_notes_by_tag(tag: str, index: VaultIndex) -> list[str]:
-    return index.get_notes_by_tag(tag)
-
-
 def get_vault_conventions() -> str:
     cfg = get_config()
     storage = VaultStorage.from_config(cfg)
@@ -184,10 +180,6 @@ def get_tasks(
         except Exception:
             pass
     return results
-
-
-def get_daily_note(index: VaultIndex, date_str: str = "today") -> dict:
-    return get_periodic_note(index, period="daily", date_str=date_str)
 
 
 def resolve_alias(name: str, index: VaultIndex) -> str | None:
