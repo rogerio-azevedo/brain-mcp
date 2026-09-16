@@ -421,7 +421,9 @@ Each vault entry can set `read_paths`, `write_paths`, `deny_read_paths`,
 `deny_write_paths`, `exclude_paths`, and `read_only` independently. Path rules
 are rooted: a trailing slash includes descendants, while a rule without one
 matches only that exact path. `exclude_paths` controls discovery/indexing;
-the read/write/deny fields are the access-control boundary.
+the read/write/deny fields are the access-control boundary. A single identity
+can additionally be given a narrower view of one of its vaults — see
+[Per-Identity Path Policy](#per-identity-path-policy).
 
 ```env
 VAULT_PATH=              # unused — vaults.json defines paths instead
@@ -454,6 +456,61 @@ allowed to pass — the built-in instructions tell Claude to call it first
 and pass `vault=` when the conversation clearly points at a non-default
 vault. There's no server-side memory of which vault was picked last; it's
 re-selected on every call, same as any other argument.
+
+### Per-Identity Path Policy
+
+By default every identity sees a vault through that vault's own policy. To
+give one identity a *narrower* view of a vault it already has access to,
+write `"vaults"` as an object instead of an array and attach a policy
+override to the vault name:
+
+```json
+{
+  "vaults": {
+    "monari": {"path": "/vaults/monari", "write_paths": ["02-Areas/monari/"]}
+  },
+  "identities": [
+    {"type": "api_key", "value": "sk-me", "vaults": ["monari"]},
+    {
+      "type": "github_login",
+      "value": "your-coworkers-github-username",
+      "vaults": {
+        "monari": {
+          "read_paths": ["02-Areas/monari/"],
+          "write_paths": ["02-Areas/monari/shared/"],
+          "deny_read_paths": ["02-Areas/monari/salaries/"],
+          "deny_write_paths": ["02-Areas/monari/shared/policy.md"],
+          "read_only": false
+        }
+      }
+    }
+  ]
+}
+```
+
+Both forms can be mixed freely across identities, and the array form keeps
+working exactly as before — `"vaults": ["private", "monari"]` means "inherit
+each vault's policy unchanged". An override may omit any field to inherit it;
+`{}` is an override that changes nothing.
+
+**An override can only ever restrict, never widen:**
+
+| Field | Merge rule |
+| --- | --- |
+| `read_paths`, `write_paths` | Intersect. Every override rule must resolve inside the vault's own allowlist; a rule that would widen it is a **config error that fails the server at startup**, not a silently ignored setting. If the vault has no allowlist (the whole vault is in scope), the override simply becomes the scope. |
+| `deny_read_paths`, `deny_write_paths` | Union. An override can add denials but cannot drop one the vault declares — omitting a rule does not remove it. |
+| `read_only` | OR toward `true`. An identity can force itself read-only on a writable vault; `false` cannot unlock a vault that is read-only. |
+
+Read scoping applies to tool *output*, not just direct reads. The vault index
+and file watcher stay vault-wide and identity-agnostic, so each index-backed
+tool filters what it is about to return through the same effective policy a
+`read_note_tool` call would be checked against: backlinks, orphans, broken
+links, the link graph, tag tree, `list_all_tags_tool`, tasks, vault stats,
+`query_notes_tool`, `resolve_alias_tool`, `lint_schema_tool` and
+`find_similar_notes_tool`. The link graph neither reports nor traverses
+*through* an out-of-scope note, so an unreadable hop cannot leak its own path
+or the notes it links on to; tag counts, vault stats and similarity scores are
+aggregated over the visible notes only.
 
 `/attachments/*` (the direct binary upload/download route) is fully
 multi-vault-aware: a plain `Authorization: Bearer` request resolves to that

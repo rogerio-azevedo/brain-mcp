@@ -5,6 +5,25 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added — per-identity path policy overrides
+
+`identities[].vaults` in `vaults.json` now accepts an object mapping a vault
+name to a policy override (`read_paths`, `write_paths`, `deny_read_paths`,
+`deny_write_paths`, `read_only`) in addition to the existing array of vault
+names, which keeps working unchanged and means "inherit each vault's policy".
+
+An override can only restrict: allowlists intersect (a rule outside the
+vault's own scope fails the server at startup), denylists union, and
+`read_only` ORs toward `true`. The vault index and file watcher stay
+vault-wide, so read scoping is applied per call when a tool formats its
+response — backlinks, orphans, broken links, the link graph, tag tree,
+`list_all_tags_tool`, tasks, vault stats, `query_notes_tool`,
+`resolve_alias_tool`, `lint_schema_tool` and `find_similar_notes_tool` can no
+longer name (or traverse through) a note outside the caller's read scope. See
+[Per-Identity Path Policy](README.md#per-identity-path-policy).
+
 ## [2.0.0] — Tool Surface v2
 
 A breaking release. **Every tool's response shape changed**, and 11 tools were

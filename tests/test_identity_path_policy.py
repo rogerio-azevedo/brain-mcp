@@ -3,6 +3,7 @@ the per-call read scoping every index-backed tool applies to its output."""
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -213,6 +214,27 @@ def test_config_loads_object_form_identities(tmp_path, monkeypatch):
     cfg = Config()
 
     assert cfg.identities[0].override_for("main").deny_read_paths == ("Secret/",)
+
+
+def test_documented_example_config_loads(tmp_path):
+    """vaults.json.example must stay a valid config, overrides included."""
+    example = json.loads(
+        (Path(__file__).resolve().parents[1] / "vaults.json.example").read_text(
+            encoding="utf-8"
+        )
+    )
+    for name, vault in example["vaults"].items():
+        root = tmp_path / name
+        root.mkdir()
+        vault["path"] = str(root)
+    config_path = tmp_path / "vaults.json"
+    config_path.write_text(json.dumps(example), encoding="utf-8")
+
+    _vaults, identities = load_vaults_file(str(config_path))
+
+    # The example documents both forms, and at least one real override.
+    assert any(identity.overrides for identity in identities)
+    assert any(not identity.overrides for identity in identities)
 
 
 # ── merge helpers ───────────────────────────────────────────────────────────
