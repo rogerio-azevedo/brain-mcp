@@ -9,6 +9,7 @@ from ..config import get_config
 from ..domain.index import VaultIndex
 from ..domain.parser import parse_note
 from ..storage.filesystem import VaultStorage
+from .scoping import ReadScope
 
 
 def _load_note(vault_path, note_path: str):
@@ -16,8 +17,16 @@ def _load_note(vault_path, note_path: str):
     return parse_note(VaultStorage.from_config().read_text(note_path), path=note_path)
 
 
+def _readable_notes(index: VaultIndex, scope: ReadScope | None = None) -> list[str]:
+    """Every indexed note the calling identity may see, sorted."""
+    scope = scope or ReadScope.current()
+    return sorted(scope.filter(index.get_all_notes()))
+
+
 def get_backlinks(path: str, index: VaultIndex) -> list[str]:
-    return index.get_backlinks(path)
+    # A backlink from a note this identity may not read would leak that note's
+    # existence and path, so the result is scoped like a direct read.
+    return ReadScope.current().filter(index.get_backlinks(path))
 
 
 def get_vault_conventions() -> str:
@@ -33,7 +42,7 @@ def get_vault_conventions() -> str:
 def get_broken_links(index: VaultIndex) -> list[dict]:
     cfg = get_config()
     results: list[dict] = []
-    for note_path in sorted(index.get_all_notes()):
+    for note_path in _readable_notes(index):
         try:
             note = _load_note(cfg.vault_path, note_path)
             for wl in note.wikilinks:
@@ -46,13 +55,15 @@ def get_broken_links(index: VaultIndex) -> list[dict]:
 
 def get_orphans(index: VaultIndex, exclude_folders: list[str] | None = None) -> list[str]:
     exclude_folders = exclude_folders or []
-    all_notes = index.get_all_notes()
+    scope = ReadScope.current()
     orphans = []
-    for note_path in sorted(all_notes):
+    for note_path in _readable_notes(index, scope):
         parts = Path(note_path).parts
         if any(part in exclude_folders for part in parts):
             continue
-        if not index.get_backlinks(note_path):
+        # Only visible backlinks count: an invisible one would otherwise
+        # reveal that some unreadable note links here.
+        if not scope.filter(index.get_backlinks(note_path)):
             orphans.append(note_path)
     return orphans
 
@@ -64,6 +75,7 @@ def get_link_graph(
     direction: str = "both",
 ) -> dict:
     cfg = get_config()
+    scope = ReadScope.current()
     nodes: dict[str, dict] = {}
     edges: list[dict] = []
     visited: set[str] = set()
@@ -84,18 +96,25 @@ def get_link_graph(
         current, level = queue.popleft()
         if current in visited or level > depth:
             continue
+        # A note outside this identity's read scope is neither reported nor
+        # traversed through — an unreadable hop must not leak its own path or
+        # the paths it links on to.
+        if not scope.allows(current):
+            continue
         visited.add(current)
         nodes[current] = _meta(current)
 
         if direction in ("outgoing", "both"):
             for target in sorted(index.get_outlinks(current)):
                 resolved = index.resolve_alias(target) or target
+                if not scope.allows(resolved):
+                    continue
                 edges.append({"from": current, "to": resolved, "type": "outgoing"})
                 if resolved not in visited:
                     queue.append((resolved, level + 1))
 
         if direction in ("incoming", "both"):
-            for source in index.get_backlinks(current):
+            for source in scope.filter(index.get_backlinks(current)):
                 edges.append({"from": source, "to": current, "type": "incoming"})
                 if source not in visited:
                     queue.append((source, level + 1))
@@ -113,13 +132,20 @@ def get_link_graph(
 
 
 def get_vault_stats(index: VaultIndex) -> dict:
-    all_notes = index.get_all_notes()
+    # Aggregate counts are computed over the visible notes only, so they never
+    # hint at how much content sits outside this identity's read scope.
+    scope = ReadScope.current()
+    all_notes = _readable_notes(index, scope)
     total_links = sum(len(index.get_outlinks(p)) for p in all_notes)
     orphans = get_orphans(index)
     broken = get_broken_links(index)
 
     # Most linked = notes with most backlinks
-    by_backlinks = sorted(all_notes, key=lambda p: len(index.get_backlinks(p)), reverse=True)
+    by_backlinks = sorted(
+        all_notes,
+        key=lambda p: len(scope.filter(index.get_backlinks(p))),
+        reverse=True,
+    )
 
     return {
         "total_notes": len(all_notes),
@@ -132,7 +158,8 @@ def get_vault_stats(index: VaultIndex) -> dict:
 
 
 def get_tag_tree(index: VaultIndex) -> dict:
-    return index.get_tag_tree()
+    scope = ReadScope.current()
+    return index.get_tag_tree(include=None if scope.unrestricted else scope.allows)
 
 
 def get_tasks(
@@ -146,10 +173,9 @@ def get_tasks(
     """due_before/due_after: 'YYYY-MM-DD', inclusive, compared against each
     task's 📅 due date (tasks without a due date never match either filter)."""
     cfg = get_config()
-    all_notes = index.get_all_notes()
     results: list[dict] = []
 
-    for note_path in sorted(all_notes):
+    for note_path in _readable_notes(index):
         if folder and not note_path.startswith(folder.rstrip("/") + "/"):
             continue
         try:
@@ -183,13 +209,19 @@ def get_tasks(
 
 
 def resolve_alias(name: str, index: VaultIndex) -> str | None:
-    return index.resolve_alias(name)
+    resolved = index.resolve_alias(name)
+    if resolved is None or not ReadScope.current().allows(resolved):
+        return None
+    return resolved
 
 
 def list_all_tags(index: VaultIndex, sort_by: str = "count") -> list[dict]:
     """Return all tags in the vault with note counts.
     sort_by: 'count' (descending) | 'name' (ascending)."""
-    counts = index.get_all_tags_with_counts()
+    scope = ReadScope.current()
+    counts = index.get_all_tags_with_counts(
+        include=None if scope.unrestricted else scope.allows
+    )
     tags = [{"tag": tag, "count": count} for tag, count in counts.items()]
     if sort_by == "name":
         tags.sort(key=lambda x: x["tag"])
@@ -320,13 +352,13 @@ def query_notes(
     {"$exists": True|False}."""
     cfg = get_config()
     storage = VaultStorage.from_config(cfg)
-    all_notes = index.get_all_notes()
+    all_notes = _readable_notes(index)
     results: list[dict] = []
 
     if frontmatter_filter:
         matches_frontmatter_filter({}, frontmatter_filter)  # validate operators up front
 
-    for note_path in sorted(all_notes):
+    for note_path in all_notes:
         if folder and not note_path.startswith(folder.rstrip("/") + "/"):
             continue
         try:

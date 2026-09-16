@@ -28,7 +28,15 @@
     {
       "type": "github_login",
       "value": "your-coworkers-github-username",
-      "vaults": ["monari"]
+      "vaults": {
+        "monari": {
+          "read_paths": ["02-Areas/monari/"],
+          "write_paths": ["02-Areas/monari/shared/"],
+          "deny_read_paths": ["02-Areas/monari/salaries/"],
+          "deny_write_paths": ["02-Areas/monari/shared/policy.md"],
+          "read_only": false
+        }
+      }
     }
   ]
 }
