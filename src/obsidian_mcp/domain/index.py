@@ -5,7 +5,7 @@ import stat
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -219,10 +219,20 @@ class VaultIndex:
         with self._lock:
             return sorted(self._tags_index.get(tag, set()))
 
-    def get_all_tags_with_counts(self) -> dict[str, int]:
+    def get_all_tags_with_counts(
+        self, include: Callable[[str], bool] | None = None
+    ) -> dict[str, int]:
+        """Tag → note count. ``include`` restricts which notes are counted
+        (per-identity read scoping); a tag left with no note is dropped."""
         self._assert_ready()
         with self._lock:
-            return {tag: len(notes) for tag, notes in self._tags_index.items()}
+            if include is None:
+                return {tag: len(notes) for tag, notes in self._tags_index.items()}
+            counts = {
+                tag: sum(1 for note in notes if include(note))
+                for tag, notes in self._tags_index.items()
+            }
+            return {tag: count for tag, count in counts.items() if count}
 
     def get_all_notes(self) -> set[str]:
         self._assert_ready()
@@ -238,11 +248,18 @@ class VaultIndex:
         with self._lock:
             return self._block_index.get(path, {}).get(block_id)
 
-    def get_tag_tree(self) -> dict:
+    def get_tag_tree(self, include: Callable[[str], bool] | None = None) -> dict:
+        """Nested tag tree. ``include`` restricts which notes appear (and
+        which tags survive at all), for per-identity read scoping."""
         self._assert_ready()
         with self._lock:
             tree: dict = {}
-            for tag, notes in self._tags_index.items():
+            for tag, all_notes in self._tags_index.items():
+                notes = all_notes if include is None else {
+                    note for note in all_notes if include(note)
+                }
+                if not notes:
+                    continue
                 parts = tag.split("/")
                 node = tree
                 for part in parts[:-1]:

@@ -15,7 +15,7 @@ from collections import Counter
 
 from ..config import get_config
 from ..domain.index import VaultIndex
-from .query import _load_note
+from .query import _load_note, _readable_notes
 
 # Words of 3+ letters (Unicode-aware) — short function words carry little
 # signal for "is this note about the same thing".
@@ -61,7 +61,9 @@ def find_similar_notes(
     most similar first."""
     cfg = get_config()
     docs: dict[str, Counter] = {}
-    for note_path in index.get_all_notes():
+    # Scoped before the corpus is built, so an unreadable note influences
+    # neither the results nor the document frequencies behind the scores.
+    for note_path in _readable_notes(index):
         if note_path == exclude_path:
             continue
         try:

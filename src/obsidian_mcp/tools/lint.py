@@ -6,7 +6,7 @@ import re
 
 from ..config import get_config
 from ..domain.index import VaultIndex
-from .query import _load_note, get_vault_conventions
+from .query import _load_note, _readable_notes, get_vault_conventions
 
 # A fenced code block, optionally tagged ```yaml.
 _YAML_BLOCK_RE = re.compile(r"```(?:yaml)?\n(.*?)```", re.DOTALL)
@@ -64,7 +64,7 @@ def lint_schema(index: VaultIndex) -> dict:
     if not schema:
         return {"schema": schema, "violations": violations}
 
-    for note_path in sorted(index.get_all_notes()):
+    for note_path in _readable_notes(index):
         try:
             note = _load_note(cfg.vault_path, note_path)
         except Exception:
