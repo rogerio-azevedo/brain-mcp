@@ -250,11 +250,20 @@ class VaultIndex:
 
     def get_tag_tree(self, include: Callable[[str], bool] | None = None) -> dict:
         """Nested tag tree. ``include`` restricts which notes appear (and
-        which tags survive at all), for per-identity read scoping."""
+        which tags survive at all), for per-identity read scoping.
+
+        A tag name can simultaneously be a leaf (e.g. ``public``) and a
+        namespace prefix of another tag (e.g. ``public/nested``). Both
+        directions are reconciled here regardless of which one is processed
+        first, by converting a bare leaf-list into a dict (with its notes
+        moved under ``_notes``) the moment it needs children, or by folding
+        a new leaf's notes into an existing dict node's ``_notes``.
+        """
         self._assert_ready()
         with self._lock:
             tree: dict = {}
-            for tag, all_notes in self._tags_index.items():
+            for tag in sorted(self._tags_index):
+                all_notes = self._tags_index[tag]
                 notes = all_notes if include is None else {
                     note for note in all_notes if include(note)
                 }
@@ -263,7 +272,11 @@ class VaultIndex:
                 parts = tag.split("/")
                 node = tree
                 for part in parts[:-1]:
-                    node = node.setdefault(part, {})
+                    child = node.setdefault(part, {})
+                    if not isinstance(child, dict):
+                        child = {"_notes": child}
+                        node[part] = child
+                    node = child
                 leaf = parts[-1]
                 if leaf not in node:
                     node[leaf] = []
